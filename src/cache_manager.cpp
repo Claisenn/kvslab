@@ -1,8 +1,60 @@
 #include "kvslab/cache_manager.hpp"
 
 #include <cassert>
+#include <utility>
 
 namespace kvslab {
+
+void CacheManager::Allocation::disarm() {
+  ok = false;
+  cached_tokens = 0;
+  cached_blocks = 0;
+  blocks.clear();
+  pinned = nullptr;
+  owner_ = nullptr;
+}
+
+CacheManager::Allocation::~Allocation() {
+  if (ok && owner_ != nullptr) owner_->abandon(*this);
+}
+
+CacheManager::Allocation::Allocation(Allocation&& other) noexcept
+    : ok(other.ok),
+      cached_tokens(other.cached_tokens),
+      cached_blocks(other.cached_blocks),
+      blocks(std::move(other.blocks)),
+      pinned(other.pinned),
+      owner_(other.owner_) {
+  // The moved-from handle must not release what this one now owns.
+  other.disarm();
+}
+
+CacheManager::Allocation& CacheManager::Allocation::operator=(
+    Allocation&& other) noexcept {
+  if (this == &other) return *this;
+  if (ok && owner_ != nullptr) owner_->abandon(*this);
+
+  ok = other.ok;
+  cached_tokens = other.cached_tokens;
+  cached_blocks = other.cached_blocks;
+  blocks = std::move(other.blocks);
+  pinned = other.pinned;
+  owner_ = other.owner_;
+  other.disarm();
+  return *this;
+}
+
+void CacheManager::abandon(Allocation& alloc) {
+  // Everything release() does except publishing to the index. Only the blocks
+  // this sequence allocated carry a reference from it; the cached prefix was
+  // held by the pin.
+  for (std::size_t i = alloc.cached_blocks; i < alloc.blocks.size(); ++i) {
+    pool_.decref(alloc.blocks[i]);
+  }
+  if (alloc.pinned != nullptr) tree_.unlock(alloc.pinned);
+  ++stats_.abandoned;
+  alloc.disarm();
+}
 
 CacheManager::CacheManager(const CacheConfig& cfg)
     : cfg_(cfg), pool_(cfg), tree_(pool_, cfg.block_tokens) {}
@@ -56,6 +108,7 @@ CacheManager::Allocation CacheManager::acquire(const std::vector<TokenId>& token
   stats_.total_tokens += tokens.size();
   stats_.hit_tokens += alloc.cached_tokens;
   alloc.ok = true;
+  alloc.owner_ = this;  // arms the handle: dropping it now gives the blocks back
   return alloc;
 }
 
@@ -75,7 +128,9 @@ void CacheManager::release(const std::vector<TokenId>& tokens, Allocation& alloc
   }
 
   if (alloc.pinned != nullptr) tree_.unlock(alloc.pinned);
-  alloc = Allocation{};
+  // disarm() rather than assigning a fresh handle: move-assignment would see
+  // this one still armed and abandon it, releasing everything a second time.
+  alloc.disarm();
 }
 
 }  // namespace kvslab

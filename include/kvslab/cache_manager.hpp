@@ -28,10 +28,17 @@ class CacheManager {
   // the lock count and exposing the prefix to eviction while the original is
   // still reading it -- and decref the fresh blocks twice, handing live blocks
   // back to the free list for another sequence to overwrite.
+  //
+  // Destroying a live handle gives the blocks and the pin back rather than
+  // stranding them. It cannot publish to the index on the way out -- that needs
+  // the token sequence, which the handle does not carry -- so the KV is lost,
+  // but a dropped handle costs a cache entry instead of leaking pool capacity
+  // and pinning a prefix that can then never be evicted.
   struct Allocation {
     Allocation() = default;
-    Allocation(Allocation&&) = default;
-    Allocation& operator=(Allocation&&) = default;
+    ~Allocation();
+    Allocation(Allocation&& other) noexcept;
+    Allocation& operator=(Allocation&& other) noexcept;
     Allocation(const Allocation&) = delete;
     Allocation& operator=(const Allocation&) = delete;
 
@@ -40,6 +47,14 @@ class CacheManager {
     std::size_t cached_blocks = 0;  // leading entries of `blocks` already cached
     std::vector<BlockId> blocks;    // full block table for the sequence
     RadixTree::Node* pinned = nullptr;
+
+   private:
+    friend class CacheManager;
+    // Give up ownership without releasing anything -- for the paths that have
+    // already done the releasing themselves.
+    void disarm();
+
+    CacheManager* owner_ = nullptr;
   };
 
   struct Stats {
@@ -49,6 +64,7 @@ class CacheManager {
     std::uint64_t hit_tokens = 0;      // of those, the ones cache supplied
     std::uint64_t evicted_blocks = 0;
     std::uint64_t alloc_failures = 0;
+    std::uint64_t abandoned = 0;  // handles destroyed without release()
 
     // Share of served tokens that came from cache.
     //
@@ -74,6 +90,9 @@ class CacheManager {
   RadixTree& tree() { return tree_; }
 
  private:
+  // Hand back what a destroyed handle still holds, without publishing it.
+  void abandon(Allocation& alloc);
+
   CacheConfig cfg_;
   BlockPool pool_;
   RadixTree tree_;

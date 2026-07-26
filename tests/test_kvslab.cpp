@@ -466,6 +466,53 @@ TEST(cache_manager_release_spends_the_handle) {
   cm.release(seq, again);
 }
 
+TEST(cache_manager_dropped_handle_returns_its_blocks) {
+  CacheManager cm(tiny_config(64));
+  const std::vector<TokenId> hot = iota_tokens(1, 8);
+  run_once(cm, hot);  // 2 blocks now cached
+
+  {
+    auto walked_away = cm.acquire(concat(hot, iota_tokens(900, 8)));
+    CHECK(walked_away.ok);
+    CHECK_EQ(walked_away.cached_tokens, std::size_t{8});
+    // Scope ends without release(): the caller forgot, or an exception
+    // unwound past it. The handle must clean up either way.
+  }
+
+  CHECK_EQ(cm.stats().abandoned, std::uint64_t{1});
+  // The fresh blocks are back -- only the cached prefix is still resident --
+  // and the pin is gone, so the prefix is evictable again.
+  CHECK_EQ(cm.pool().num_used(), std::size_t{2});
+  CHECK_EQ(cm.tree().evict(2), std::size_t{2});
+  CHECK_EQ(cm.pool().num_used(), std::size_t{0});
+}
+
+TEST(cache_manager_moved_handle_releases_exactly_once) {
+  CacheManager cm(tiny_config(64));
+  const std::vector<TokenId> seq = iota_tokens(1, 16);
+
+  auto first = cm.acquire(seq);
+  CHECK(first.ok);
+
+  // Ownership transfers; the moved-from handle is disarmed and its destruction
+  // must not release anything.
+  auto second = std::move(first);
+  CHECK(!first.ok);
+  CHECK(second.ok);
+
+  cm.release(seq, second);
+  CHECK_EQ(cm.stats().abandoned, std::uint64_t{0});
+  CHECK_EQ(cm.pool().num_used(), reachable_blocks(cm.tree()));
+
+  // Move-assigning over a live handle abandons what it held first.
+  auto third = cm.acquire(iota_tokens(500, 8));
+  auto fourth = cm.acquire(iota_tokens(900, 8));
+  third = std::move(fourth);
+  CHECK_EQ(cm.stats().abandoned, std::uint64_t{1});
+  cm.release(iota_tokens(900, 8), third);
+  CHECK_EQ(cm.pool().num_used(), reachable_blocks(cm.tree()));
+}
+
 TEST(cache_manager_leaks_no_blocks_across_a_mixed_workload) {
   CacheManager cm(tiny_config(32));
   const std::vector<TokenId> prompt = iota_tokens(1, 12);
