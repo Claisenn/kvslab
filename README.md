@@ -14,8 +14,10 @@ written here.
 
 ## Status
 
-Phase 1 — block management and prefix reuse. Single node, host memory, no GPU
-required.
+Phase 2 — tiered storage. Phase 1 (block management and prefix reuse) is
+complete; the cache now runs over a compute tier plus a spill tier, demoting
+cold entries instead of dropping them and migrating blocks on background
+workers behind a readiness gate. Single node, host memory, no GPU required.
 
 ## Design
 
@@ -86,11 +88,15 @@ builds by default; `-DKVSLAB_ENABLE_ASSERTS=OFF` turns those off.
 
 ## Roadmap
 
-- **Phase 1** — block allocator, block-aligned radix prefix index, pinning and
-  LRU eviction, tests and benchmarks.
-- **Phase 2** — tiered storage. Abstract the arena into a `Tier`, stack
-  HBM / DRAM / NVMe, move blocks asynchronously on a background thread so
-  transfer overlaps compute. NVMe via `io_uring`.
+- **Phase 1** ✅ — block allocator, block-aligned radix prefix index, pinning
+  and LRU eviction, tests and benchmarks.
+- **Phase 2** — tiered storage. Done: the `Tier` abstraction, stable block
+  identities that survive migration, demotion to spill instead of eviction with
+  promotion on hit, and asynchronous migration in both directions — background
+  demotion to a watermark, promotion behind an `Allocation::ready()` gate, a
+  small worker pool. On the oversubscription benchmark this serves 80% of the
+  requests a single tier misses entirely, at 93% of its request rate.
+  Remaining: an NVMe-backed tier via `io_uring`.
 - **Phase 3** — transfer engine. Zero-copy KV movement between nodes for
   prefill/decode disaggregation: TCP baseline first for correctness, then RDMA
   over `ibverbs`.
