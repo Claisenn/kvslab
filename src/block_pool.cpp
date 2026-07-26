@@ -81,14 +81,21 @@ BlockPool::~BlockPool() {
     stopping_ = true;
   }
   queue_cv_.notify_all();
-  if (worker_.joinable()) worker_.join();
+  for (std::thread& worker : workers_) {
+    if (worker.joinable()) worker.join();
+  }
   // Unfinished jobs die with the pool; the tiers outlive it by contract, and
   // nothing will ever observe the locations that were never rebound.
 }
 
 void BlockPool::ensure_worker() {
-  if (worker_.joinable()) return;
-  worker_ = std::thread([this] { worker_loop(); });
+  if (!workers_.empty()) return;
+  const unsigned hw = std::thread::hardware_concurrency();
+  const unsigned count = hw >= 4 ? 3 : 1;
+  workers_.reserve(count);
+  for (unsigned i = 0; i < count; ++i) {
+    workers_.emplace_back([this] { worker_loop(); });
+  }
 }
 
 void BlockPool::worker_loop() {
@@ -114,9 +121,9 @@ void BlockPool::worker_loop() {
   }
 }
 
-bool BlockPool::demote_async(BlockId id, TierIndex dst) {
+bool BlockPool::migrate_async(BlockId id, TierIndex dst) {
   const Location& loc = locate(id);
-  if (dst >= tiers_.size()) fatal("async demote to an out-of-range tier", id);
+  if (dst >= tiers_.size()) fatal("async migrate to an out-of-range tier", id);
   if (loc.tier == dst) return false;
   if (migrating_.find(id) != migrating_.end()) return false;
   if (tiers_[dst].free_slots.empty()) return false;
@@ -149,6 +156,21 @@ bool BlockPool::demote_async(BlockId id, TierIndex dst) {
 
 bool BlockPool::migrating(BlockId id) const {
   return migrating_.find(id) != migrating_.end();
+}
+
+std::size_t BlockPool::pending_departures(TierIndex tier) const {
+  std::size_t count = 0;
+  for (const auto& [id, job] : migrating_) {
+    // The location is not rebound until drain, so it still names the source.
+    if (location_[id].tier == tier && job->dst_tier != tier) ++count;
+  }
+  return count;
+}
+
+BlockPool::TierIndex BlockPool::migration_target(BlockId id) const {
+  auto it = migrating_.find(id);
+  if (it == migrating_.end()) fatal("migration_target of a block not migrating", id);
+  return it->second->dst_tier;
 }
 
 void BlockPool::cancel_migration(BlockId id) {

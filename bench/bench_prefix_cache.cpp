@@ -9,7 +9,9 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <deque>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "kvslab/cache_manager.hpp"
@@ -149,6 +151,33 @@ TieredResult run_manager(CacheManager& cm, const std::vector<std::vector<TokenId
   return TieredResult{std::chrono::duration<double>(end - start).count(), cm.stats()};
 }
 
+// Continuous batching in miniature: keep `depth` requests in flight, waiting
+// on the oldest one's readiness while the younger ones' promotion copies run
+// behind it. This is the access pattern async promotion exists for -- a lone
+// request that waits immediately after acquiring gains nothing.
+TieredResult run_pipelined(CacheManager& cm,
+                           const std::vector<std::vector<TokenId>>& workload,
+                           std::size_t depth) {
+  std::deque<std::pair<CacheManager::Allocation, const std::vector<TokenId>*>> window;
+  const auto start = std::chrono::steady_clock::now();
+  for (const std::vector<TokenId>& tokens : workload) {
+    auto alloc = cm.acquire(tokens);
+    if (alloc.ok) window.emplace_back(std::move(alloc), &tokens);
+    if (window.size() >= depth) {
+      window.front().first.wait_ready();
+      cm.release(*window.front().second, window.front().first);
+      window.pop_front();
+    }
+  }
+  while (!window.empty()) {
+    window.front().first.wait_ready();
+    cm.release(*window.front().second, window.front().first);
+    window.pop_front();
+  }
+  const auto end = std::chrono::steady_clock::now();
+  return TieredResult{std::chrono::duration<double>(end - start).count(), cm.stats()};
+}
+
 void print_tier_row(const std::string& name, const TieredResult& r) {
   const CacheManager::Stats& s = r.stats;
   const double reqs_per_sec =
@@ -193,19 +222,28 @@ void bench_tiering(const CacheConfig& cfg) {
     // Keep a quarter of the compute tier free via background demotion, so
     // requests find room waiting instead of copying on the acquire path.
     CacheManager cm({{&compute, compute_blocks}, {&spill, spill_blocks}}, cfg,
-                    compute_blocks / 4);
+                    {.spill_watermark = compute_blocks / 4});
     print_tier_row("  + async watermark", run_manager(cm, workload));
+  }
+  {
+    HostTier compute(compute_blocks * cfg.block_bytes());
+    HostTier spill(spill_blocks * cfg.block_bytes());
+    CacheManager cm({{&compute, compute_blocks}, {&spill, spill_blocks}}, cfg,
+                    {.spill_watermark = compute_blocks / 4, .async_promotion = true});
+    print_tier_row("  + async promote x8", run_pipelined(cm, workload, 8));
   }
 
   // Read the columns together, not req/s alone. Evicting is free here because
   // the benchmark never pays for the recompute an eviction causes in a real
   // engine -- a prefill of this sequence length costs milliseconds of GPU time
   // per miss. The `demoted` column is the copies still paid on the acquire
-  // path; the watermark row moves most of them to the background worker, and
-  // what remains on-path is promotion, which prefetching would address next.
+  // path. The last row keeps a window of requests in flight and gates each on
+  // ready(), so promotion copies overlap the requests behind them -- the same
+  // overlap a continuously-batching engine gets for free.
   std::printf(
       "  (evictions cost nothing here; in a real engine each is a recompute.\n"
-      "   demoted = copies on the request path; promotions are always on it.)\n");
+      "   demoted = copies on the request path; the pipelined row overlaps\n"
+      "   promotion copies with the requests queued behind them.)\n");
 }
 
 void print_row(const std::string& name, const Result& r) {

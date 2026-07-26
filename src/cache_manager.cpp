@@ -60,25 +60,46 @@ CacheManager::CacheManager(const CacheConfig& cfg)
     : cfg_(cfg), pool_(cfg), tree_(pool_, cfg.block_tokens) {}
 
 CacheManager::CacheManager(const std::vector<BlockPool::TierSpec>& specs,
-                           const CacheConfig& cfg, std::size_t spill_watermark)
+                           const CacheConfig& cfg, Options options)
     : cfg_(cfg),
       pool_(specs, cfg),
       tree_(pool_, cfg.block_tokens),
-      watermark_(spill_watermark) {}
+      options_(options) {}
+
+CacheManager::CacheManager(const std::vector<BlockPool::TierSpec>& specs,
+                           const CacheConfig& cfg)
+    : CacheManager(specs, cfg, Options{}) {}
+
+bool CacheManager::Allocation::ready() {
+  if (!ok || owner_ == nullptr) return true;  // nothing outstanding to wait on
+  owner_->pool_.drain_migrations();
+  for (BlockId id : blocks) {
+    if (owner_->pool_.block_tier(id) != 0) return false;
+  }
+  return true;
+}
+
+void CacheManager::Allocation::wait_ready() {
+  // wait_for_migrations() waits on every queued job, not just this table's
+  // promotions, so this can overshoot by a demotion or two. Acceptable until a
+  // profile says targeted waiting is worth the bookkeeping.
+  while (!ready()) owner_->pool_.wait_for_migrations();
+}
 
 void CacheManager::maintain() {
-  if (pool_.num_tiers() < 2 || watermark_ == 0) return;
+  if (pool_.num_tiers() < 2 || options_.spill_watermark == 0) return;
 
   // Count in-flight demotions as free-to-be: each will hand back a compute
   // slot at a future drain, and scheduling more for the same shortage would
-  // demote deeper into the working set than the watermark asks for.
-  const std::size_t projected = pool_.num_free() + pool_.pending_migrations();
-  if (projected >= watermark_) return;
+  // demote deeper into the working set than the watermark asks for. In-flight
+  // promotions already claimed their slot and contribute nothing.
+  const std::size_t projected = pool_.num_free() + pool_.pending_departures(0);
+  if (projected >= options_.spill_watermark) return;
 
   victims_.clear();
-  tree_.pick_demotion_victims(watermark_ - projected, &victims_);
+  tree_.pick_demotion_victims(options_.spill_watermark - projected, &victims_);
   for (BlockId id : victims_) {
-    if (!pool_.demote_async(id, 1)) break;  // spill full; no point continuing
+    if (!pool_.migrate_async(id, 1)) break;  // spill full; no point continuing
     ++stats_.background_demotions;
   }
 }
@@ -113,18 +134,25 @@ CacheManager::Allocation CacheManager::acquire(const std::vector<TokenId>& token
 
   // A matched block with a demotion in flight is about to be read; the move
   // must not land after the block table is handed out. Cancelling keeps the
-  // block where it is -- it never left the compute tier.
+  // block where it is -- it never left the compute tier. A promotion in
+  // flight is the opposite case: it is exactly what this request needs, so it
+  // is left to finish (possibly scheduled by an earlier request on the same
+  // prefix, which is also why it must not be cancelled out from under them).
   for (BlockId id : alloc.blocks) {
-    pool_.cancel_migration(id);
+    if (pool_.migrating(id) && pool_.migration_target(id) != 0) {
+      pool_.cancel_migration(id);
+    }
   }
 
   // Compute-tier demand: slots for the new blocks, plus one per matched block
   // currently in a spill tier -- the kernel reads from compute memory, so a
-  // hit on a demoted prefix has to bring it back before it counts.
+  // hit on a demoted prefix has to bring it back before it counts. A block
+  // already promoting has its slot reserved by the in-flight job and costs
+  // nothing more.
   const std::size_t fresh = need_blocks - alloc.cached_blocks;
   std::size_t promotions = 0;
   for (BlockId id : alloc.blocks) {
-    if (pool_.block_tier(id) != 0) ++promotions;
+    if (pool_.block_tier(id) != 0 && !pool_.migrating(id)) ++promotions;
   }
   const std::size_t demand = fresh + promotions;
 
@@ -155,9 +183,19 @@ CacheManager::Allocation CacheManager::acquire(const std::vector<TokenId>& token
 
   // Promote what the hit needs. Slots were counted into `demand`, so these
   // cannot fail; the spill slots they vacate become room for future demotions.
+  // Blocks already promoting are skipped -- their job carries them.
   for (BlockId id : alloc.blocks) {
-    if (pool_.block_tier(id) == 0) continue;
-    const bool moved = pool_.migrate(id, 0);
+    if (pool_.block_tier(id) == 0 || pool_.migrating(id)) continue;
+    bool moved;
+    if (options_.async_promotion) {
+      // The copy overlaps whatever the engine does next; the caller gates on
+      // ready() before reading. Falls back to a synchronous copy for a tier
+      // the worker cannot address.
+      moved = pool_.migrate_async(id, 0);
+      if (!moved) moved = pool_.migrate(id, 0);
+    } else {
+      moved = pool_.migrate(id, 0);
+    }
     assert(moved && "promotion failed despite reserved compute slots");
     (void)moved;
     ++stats_.promoted_blocks;

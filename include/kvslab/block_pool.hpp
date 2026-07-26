@@ -88,11 +88,18 @@ class BlockPool {
   // bytes; all bookkeeping stays externally synchronized, same as ever.
 
   // Reserves a slot in `dst` and queues the copy. False when `dst` is full or
-  // the block already has a migration in flight.
-  bool demote_async(BlockId id, TierIndex dst);
+  // the block already has a migration in flight. Works in either direction:
+  // a demotion frees a compute slot at drain, a promotion claims one now.
+  bool migrate_async(BlockId id, TierIndex dst);
 
   // True while a queued or running migration exists for the block.
   bool migrating(BlockId id) const;
+
+  // The tier an in-flight migration is headed to. Callers use this to treat
+  // the two directions differently: a demotion of a block about to be read
+  // gets cancelled, a promotion of it is exactly what the reader wants.
+  // Precondition: migrating(id).
+  TierIndex migration_target(BlockId id) const;
 
   // Abandons an in-flight migration. The block keeps its current location;
   // the reserved destination slot is reclaimed once the worker is done with
@@ -107,6 +114,11 @@ class BlockPool {
   void wait_for_migrations();
 
   std::size_t pending_migrations() const { return migrating_.size(); }
+
+  // In-flight migrations moving *out of* `tier` -- each will free one of its
+  // slots at a future drain. The distinction matters once promotions share the
+  // queue: those already claimed their destination slot and free nothing.
+  std::size_t pending_departures(TierIndex tier) const;
 
   // Byte offset of the block within its current tier's arena. Valid on every
   // tier; the offset is only meaningful together with block_tier().
@@ -178,10 +190,12 @@ class BlockPool {
   std::deque<std::unique_ptr<MigrationJob>> jobs_;
   std::unordered_map<BlockId, MigrationJob*> migrating_;
 
-  std::thread worker_;
+  // Copies are memory-bound, so a couple of workers saturate what the bus
+  // will give; the claim cursor already supports any number of consumers.
+  std::vector<std::thread> workers_;
   std::mutex queue_mutex_;
   std::condition_variable queue_cv_;
-  std::size_t next_unclaimed_ = 0;  // guarded by queue_mutex_: worker's cursor
+  std::size_t next_unclaimed_ = 0;  // guarded by queue_mutex_: claim cursor
   bool stopping_ = false;           // guarded by queue_mutex_
 };
 

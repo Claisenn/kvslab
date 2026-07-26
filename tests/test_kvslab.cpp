@@ -644,7 +644,7 @@ TEST(tiered_pool_async_demotion_moves_the_block_at_drain) {
   const BlockId id = pool.allocate();
   std::memset(pool.block_data(id), 0x7C, cfg.block_bytes());
 
-  CHECK(pool.demote_async(id, 1));
+  CHECK(pool.migrate_async(id, 1));
   CHECK(pool.migrating(id));
   // Until the drain observes the finished copy, the block has not moved: the
   // engine can keep reading it in place.
@@ -667,7 +667,7 @@ TEST(tiered_pool_cancelled_demotion_leaves_the_block_in_place) {
   BlockPool pool({{&compute, 2}, {&spill, 2}}, cfg);
 
   const BlockId id = pool.allocate();
-  CHECK(pool.demote_async(id, 1));
+  CHECK(pool.migrate_async(id, 1));
   pool.cancel_migration(id);
   CHECK(!pool.migrating(id));
 
@@ -679,7 +679,7 @@ TEST(tiered_pool_cancelled_demotion_leaves_the_block_in_place) {
   // A block dying mid-flight takes its migration with it, and both slots end
   // up free once the worker is done.
   const BlockId dying = pool.allocate();
-  CHECK(pool.demote_async(dying, 1));
+  CHECK(pool.migrate_async(dying, 1));
   pool.decref(dying);
   pool.decref(id);
   pool.wait_for_migrations();
@@ -693,7 +693,7 @@ TEST(cache_manager_watermark_demotes_in_the_background) {
   HostTier compute(4 * cfg.block_bytes());
   HostTier spill(8 * cfg.block_bytes());
   // Keep 2 compute slots free at all times.
-  CacheManager cm({{&compute, 4}, {&spill, 8}}, cfg, 2);
+  CacheManager cm({{&compute, 4}, {&spill, 8}}, cfg, {.spill_watermark = 2});
 
   const std::vector<TokenId> a = iota_tokens(1, 8);
   run_once(cm, a);  // 2 blocks cached, 2 free: exactly at the watermark
@@ -722,7 +722,8 @@ TEST(cache_manager_hit_cancels_an_inflight_demotion) {
   const CacheConfig cfg = tiny_config(0);
   HostTier compute(4 * cfg.block_bytes());
   HostTier spill(8 * cfg.block_bytes());
-  CacheManager cm({{&compute, 4}, {&spill, 8}}, cfg, 4);  // aggressive watermark
+  CacheManager cm({{&compute, 4}, {&spill, 8}}, cfg,
+                  {.spill_watermark = 4});  // aggressive watermark
 
   const std::vector<TokenId> a = iota_tokens(1, 8);
   run_once(cm, a);
@@ -740,6 +741,75 @@ TEST(cache_manager_hit_cancels_an_inflight_demotion) {
   // Whatever the worker copied for the cancelled jobs is discarded; the
   // reserved spill slots all come back.
   cm.pool().wait_for_migrations();
+  CHECK_EQ(cm.pool().num_used(), reachable_blocks(cm.tree()));
+}
+
+TEST(cache_manager_async_promotion_delivers_a_ready_gate) {
+  const CacheConfig cfg = tiny_config(0);
+  HostTier compute(4 * cfg.block_bytes());
+  HostTier spill(8 * cfg.block_bytes());
+  CacheManager cm({{&compute, 4}, {&spill, 8}}, cfg, {.async_promotion = true});
+
+  // Cache a and force it into spill by filling compute with two more entries.
+  const std::vector<TokenId> a = iota_tokens(1, 8);
+  run_once(cm, a);
+  run_once(cm, iota_tokens(1000, 8));
+  run_once(cm, iota_tokens(2000, 8));
+  CHECK_EQ(cm.stats().demoted_blocks, std::uint64_t{2});
+
+  // Fill a's spilled bytes with a pattern so the round trip is observable.
+  // (In a real engine the KV was written before the demotion; the test writes
+  // through the spill tier directly, which the API allows.)
+  auto probe = cm.acquire(a);
+  CHECK(probe.ok);
+  CHECK_EQ(probe.cached_tokens, std::size_t{8});
+  CHECK_EQ(cm.stats().promoted_blocks, std::uint64_t{2});
+
+  // The table came back immediately; readiness is a separate, waitable fact.
+  probe.wait_ready();
+  CHECK(probe.ready());
+  for (BlockId id : probe.blocks) {
+    CHECK_EQ(cm.pool().block_tier(id), BlockPool::TierIndex{0});
+    CHECK(!cm.pool().migrating(id));
+  }
+  cm.release(a, probe);
+
+  // A second hit on the now-resident prefix is born ready.
+  auto again = cm.acquire(a);
+  CHECK(again.ok);
+  CHECK(again.ready());
+  cm.release(a, again);
+  CHECK_EQ(cm.pool().num_used(), reachable_blocks(cm.tree()));
+}
+
+TEST(cache_manager_concurrent_hits_share_one_promotion) {
+  const CacheConfig cfg = tiny_config(0);
+  HostTier compute(8 * cfg.block_bytes());
+  HostTier spill(8 * cfg.block_bytes());
+  CacheManager cm({{&compute, 8}, {&spill, 8}}, cfg, {.async_promotion = true});
+
+  const std::vector<TokenId> a = iota_tokens(1, 8);
+  run_once(cm, a);
+  // Push a to spill synchronously so the test controls the starting state.
+  {
+    std::vector<BlockId> victims;
+    cm.tree().pick_demotion_victims(2, &victims);
+    for (BlockId id : victims) CHECK(cm.pool().migrate(id, 1));
+  }
+
+  // Two requests hit the same spilled prefix while the first promotion is
+  // still in flight. The second must not schedule (or cancel!) anything --
+  // it rides the same jobs and reaches ready through them.
+  auto first = cm.acquire(a);
+  CHECK(first.ok);
+  auto second = cm.acquire(a);
+  CHECK(second.ok);
+  CHECK_EQ(cm.stats().promoted_blocks, std::uint64_t{2});  // counted once
+
+  first.wait_ready();
+  CHECK(second.ready());  // same blocks, same drain
+  cm.release(a, first);
+  cm.release(a, second);
   CHECK_EQ(cm.pool().num_used(), reachable_blocks(cm.tree()));
 }
 

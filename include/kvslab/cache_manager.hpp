@@ -48,6 +48,13 @@ class CacheManager {
     std::vector<BlockId> blocks;    // full block table for the sequence
     RadixTree::Node* pinned = nullptr;
 
+    // True once every block in the table is resident in the compute tier.
+    // With async promotion the table comes back before the copies land, so
+    // the engine checks (or waits) here before launching a kernel against it.
+    // Always true when promotions ran synchronously.
+    bool ready();
+    void wait_ready();
+
    private:
     friend class CacheManager;
     // Give up ownership without releasing anything -- for the paths that have
@@ -86,16 +93,27 @@ class CacheManager {
   // pressure the only relief is eviction, as before.
   explicit CacheManager(const CacheConfig& cfg);
 
+  struct Options {
+    // Compute slots the manager tries to keep free by demoting cold entries in
+    // the background, so requests find room waiting instead of paying for a
+    // copy on the acquire path. Zero disables background demotion; pressure is
+    // then relieved synchronously, on demand.
+    std::size_t spill_watermark = 0;
+    // Run promotions on the worker too: acquire() returns the block table
+    // before the copies land, and the caller gates on Allocation::ready().
+    // Off means a hit on a spilled prefix pays its copies before returning,
+    // and every allocation is born ready.
+    bool async_promotion = false;
+  };
+
   // Tiered: specs[0] is the compute tier, specs[1] the spill tier cold
   // entries demote into instead of being dropped. Tiers are borrowed and must
   // outlive the manager.
-  //
-  // `spill_watermark` is the number of compute slots the manager tries to keep
-  // free by demoting cold entries in the background, so requests find room
-  // waiting instead of paying for a copy on the acquire path. Zero disables
-  // background demotion; pressure is then relieved synchronously, on demand.
   CacheManager(const std::vector<BlockPool::TierSpec>& specs, const CacheConfig& cfg,
-               std::size_t spill_watermark = 0);
+               Options options);
+  // Split from the above because a nested struct's default member initializers
+  // cannot back a default argument inside the enclosing class definition.
+  CacheManager(const std::vector<BlockPool::TierSpec>& specs, const CacheConfig& cfg);
 
   Allocation acquire(const std::vector<TokenId>& tokens);
   void release(const std::vector<TokenId>& tokens, Allocation& alloc);
@@ -116,7 +134,7 @@ class CacheManager {
   BlockPool pool_;
   RadixTree tree_;
   Stats stats_;
-  std::size_t watermark_ = 0;
+  Options options_;
   std::vector<BlockId> victims_;  // scratch for demotion picks
 };
 
