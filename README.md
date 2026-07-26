@@ -47,8 +47,10 @@ reports how many have been seen.
 
 *Splitting a node interposes a new **parent**, not a new child.* Callers hold
 node pointers as pins across a request's lifetime. Keeping the original object
-as the deeper half means an existing pin still covers every token it covered
-before the split, which is what makes those pointers safe to hold.
+as the deeper half means an existing pin still protects every token it protected
+before the split: pinning walks to the root, and the interposed parent inherits
+the count. The node object on its own covers less afterwards — it is the pin,
+not the pointer's own range, that callers rely on.
 
 Eviction is LRU over unpinned leaves, driven by a logical clock. A prefix an
 in-flight request is reading is pinned along with all its ancestors and cannot

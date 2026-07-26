@@ -20,7 +20,21 @@ namespace kvslab {
 //                      next request can reuse them, then unpin.
 class CacheManager {
  public:
+  // A sequence's claim on the cache: the block table to run against, plus the
+  // pin holding its reused prefix in place.
+  //
+  // Move-only, because it owns those two things and neither survives being
+  // duplicated. Releasing a copy would drop the pin a second time -- underflowing
+  // the lock count and exposing the prefix to eviction while the original is
+  // still reading it -- and decref the fresh blocks twice, handing live blocks
+  // back to the free list for another sequence to overwrite.
   struct Allocation {
+    Allocation() = default;
+    Allocation(Allocation&&) = default;
+    Allocation& operator=(Allocation&&) = default;
+    Allocation(const Allocation&) = delete;
+    Allocation& operator=(const Allocation&) = delete;
+
     bool ok = false;
     std::size_t cached_tokens = 0;  // prefix served from cache
     std::size_t cached_blocks = 0;  // leading entries of `blocks` already cached

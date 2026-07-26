@@ -39,7 +39,12 @@ class RadixTree {
   struct MatchResult {
     std::size_t num_tokens = 0;
     std::vector<BlockId> blocks;
-    Node* node = nullptr;  // deepest matched node; exactly covers num_tokens
+    // Deepest matched node. It covers exactly num_tokens when returned, but a
+    // later split can move the head of that range into a new parent, leaving
+    // the node object itself covering less. Pinning it still pins the whole
+    // matched range: lock() walks to the root, and a split hands the interposed
+    // parent the count it inherits.
+    Node* node = nullptr;
   };
 
   RadixTree(BlockPool& pool, std::size_t block_tokens);

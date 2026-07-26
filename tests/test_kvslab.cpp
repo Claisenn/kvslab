@@ -359,6 +359,31 @@ TEST(cache_manager_refuses_when_every_candidate_is_pinned) {
   cm.release(big, retried);
 }
 
+TEST(cache_manager_release_spends_the_handle) {
+  CacheManager cm(tiny_config(64));
+  const std::vector<TokenId> seq = iota_tokens(1, 16);
+
+  auto alloc = cm.acquire(seq);
+  CHECK(alloc.ok);
+  cm.release(seq, alloc);
+  CHECK(!alloc.ok);
+
+  // Releasing a spent handle must not decref the blocks or drop the pin a
+  // second time. The Allocation being move-only stops a *copy* from doing that;
+  // this covers the same handle being released twice.
+  const std::size_t used = cm.pool().num_used();
+  cm.release(seq, alloc);
+  CHECK_EQ(cm.pool().num_used(), used);
+  CHECK_EQ(cm.pool().num_used(), cm.tree().stored_blocks());
+
+  // An underflowed lock count would leave the prefix unprotected or stuck
+  // pinned; either way the cached entry must still be intact and reusable.
+  auto again = cm.acquire(seq);
+  CHECK(again.ok);
+  CHECK_EQ(again.cached_tokens, std::size_t{16});
+  cm.release(seq, again);
+}
+
 TEST(cache_manager_leaks_no_blocks_across_a_mixed_workload) {
   CacheManager cm(tiny_config(32));
   const std::vector<TokenId> prompt = iota_tokens(1, 12);
