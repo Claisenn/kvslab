@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstring>
 #include <numeric>
 #include <stdexcept>
@@ -49,6 +50,26 @@ std::vector<BlockId> publish(RadixTree& tree, BlockPool& pool,
   tree.insert(tokens, ids);
   for (BlockId id : ids) pool.decref(id);
   return ids;
+}
+
+// Blocks actually reachable from the root, counted by walking the tree.
+//
+// Deliberately not stored_blocks(): that counter is maintained by the same code
+// paths a bookkeeping bug would corrupt, so comparing it against the pool tells
+// you the two agree, not that either is right. Walking finds blocks the index
+// dropped on the floor and blocks it stored twice.
+std::size_t reachable_blocks(const RadixTree& tree) {
+  std::vector<BlockId> seen;
+  std::vector<const RadixTree::Node*> stack{tree.root()};
+  while (!stack.empty()) {
+    const RadixTree::Node* node = stack.back();
+    stack.pop_back();
+    seen.insert(seen.end(), node->blocks.begin(), node->blocks.end());
+    for (const auto& [key, child] : node->children) stack.push_back(child.get());
+  }
+  std::sort(seen.begin(), seen.end());
+  CHECK(std::adjacent_find(seen.begin(), seen.end()) == seen.end());  // no block stored twice
+  return seen.size();
 }
 
 // One full request lifecycle through the manager.
@@ -187,7 +208,37 @@ TEST(radix_tree_split_preserves_both_branches) {
 
   // Blocks the fork allocated but did not get to keep must be back on the free
   // list, not stranded.
-  CHECK_EQ(pool.num_used(), tree.stored_blocks());
+  CHECK_EQ(pool.num_used(), reachable_blocks(tree));
+}
+
+TEST(radix_tree_split_under_a_live_pin_keeps_the_prefix_protected) {
+  BlockPool pool(tiny_config(8));
+  RadixTree tree(pool, 4);
+
+  const std::vector<TokenId> long_seq = iota_tokens(1, 16);  // one 4-block node
+  publish(tree, pool, long_seq);
+
+  // A request pins the whole sequence...
+  auto held = tree.match_prefix(long_seq);
+  CHECK_EQ(held.num_tokens, std::size_t{16});
+  tree.lock(held.node);
+
+  // ...and another diverges inside the pinned node, forcing a split. held.node
+  // is now only the tail of what it covered a moment ago.
+  publish(tree, pool, concat(iota_tokens(1, 8), {700, 701, 702, 703}));
+
+  // Eviction may take the fork, but nothing the pin covers. This is the
+  // invariant the split direction exists to preserve.
+  tree.evict(8);
+  CHECK_EQ(tree.match_prefix(long_seq).num_tokens, std::size_t{16});
+
+  // Unlocking has to balance across the interposed parent. If the split had not
+  // handed it the count, this would decrement a zero and trip the assert; if it
+  // had over-counted, the nodes below would stay pinned and survive the sweep.
+  tree.unlock(held.node);
+  CHECK_EQ(tree.evict(4), std::size_t{4});
+  CHECK_EQ(tree.stored_blocks(), std::size_t{0});
+  CHECK_EQ(pool.num_used(), std::size_t{0});
 }
 
 TEST(radix_tree_does_not_cache_a_partial_trailing_block) {
@@ -390,9 +441,12 @@ TEST(cache_manager_leaks_no_blocks_across_a_mixed_workload) {
   for (TokenId turn = 0; turn < 20; ++turn) {
     run_once(cm, concat(prompt, iota_tokens(turn * 100 + 500, 9)));
   }
-  // Every block still allocated must be one the index owns; anything else is a
-  // sequence that failed to give its blocks back.
-  CHECK_EQ(cm.pool().num_used(), cm.tree().stored_blocks());
+  // Every block still allocated must be one the index can actually reach;
+  // anything else is a block nothing owns and nothing will ever free.
+  CHECK_EQ(cm.pool().num_used(), reachable_blocks(cm.tree()));
+  // And the counter must agree with the walk, which is a separate claim: one
+  // catches leaks, the other catches the bookkeeping drifting away from them.
+  CHECK_EQ(cm.tree().stored_blocks(), reachable_blocks(cm.tree()));
   // No entry should have been refused: a collision here would mean the 64-bit
   // block key is doing far worse than chance on a 20-sequence workload.
   CHECK_EQ(cm.tree().hash_collisions(), std::size_t{0});
