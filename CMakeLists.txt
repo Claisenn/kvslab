@@ -34,3 +34,7 @@ target_link_libraries(kvslab_tests PRIVATE kvslab)
 target_include_directories(kvslab_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_compile_options(kvslab_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME kvslab_tests COMMAND kvslab_tests)
+
+add_executable(bench_prefix_cache bench/bench_prefix_cache.cpp)
+target_link_libraries(bench_prefix_cache PRIVATE kvslab)
+target_compile_options(bench_prefix_cache PRIVATE -Wall -Wextra -Wpedantic)
