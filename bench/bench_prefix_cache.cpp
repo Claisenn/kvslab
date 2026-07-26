@@ -113,6 +113,92 @@ std::vector<std::vector<TokenId>> workload_multi_turn(std::size_t conversations,
   return out;
 }
 
+// Round-robin re-access over a working set larger than the compute tier: the
+// adversarial case for LRU, since the least recently used entry is always the
+// next one the stream asks for. A single tier can only evict and recompute; a
+// spill tier turns those losses into demote/promote traffic instead.
+std::vector<std::vector<TokenId>> workload_oversubscribed(std::size_t sequences,
+                                                          std::size_t len,
+                                                          std::size_t passes) {
+  Lcg rng(4);
+  std::vector<std::vector<TokenId>> unique;
+  unique.reserve(sequences);
+  for (std::size_t i = 0; i < sequences; ++i) unique.push_back(random_tokens(rng, len));
+
+  std::vector<std::vector<TokenId>> out;
+  out.reserve(sequences * passes);
+  for (std::size_t p = 0; p < passes; ++p) {
+    for (const auto& seq : unique) out.push_back(seq);
+  }
+  return out;
+}
+
+struct TieredResult {
+  double seconds;
+  CacheManager::Stats stats;
+};
+
+TieredResult run_manager(CacheManager& cm, const std::vector<std::vector<TokenId>>& workload) {
+  const auto start = std::chrono::steady_clock::now();
+  for (const std::vector<TokenId>& tokens : workload) {
+    auto alloc = cm.acquire(tokens);
+    if (!alloc.ok) continue;
+    cm.release(tokens, alloc);
+  }
+  const auto end = std::chrono::steady_clock::now();
+  return TieredResult{std::chrono::duration<double>(end - start).count(), cm.stats()};
+}
+
+void print_tier_row(const std::string& name, const TieredResult& r) {
+  const CacheManager::Stats& s = r.stats;
+  const double reqs_per_sec =
+      r.seconds > 0 ? static_cast<double>(s.requests) / r.seconds : 0.0;
+  std::printf("%-22s %10.1f %10.1f%% %11llu %9llu %9llu\n", name.c_str(), reqs_per_sec,
+              s.hit_rate() * 100.0, static_cast<unsigned long long>(s.evicted_blocks),
+              static_cast<unsigned long long>(s.demoted_blocks),
+              static_cast<unsigned long long>(s.promoted_blocks));
+}
+
+void bench_tiering(const CacheConfig& cfg) {
+  // Working set is twice the compute tier; the spill tier absorbs the rest.
+  const std::size_t compute_blocks = 1024;
+  const std::size_t spill_blocks = 2048;
+  const std::size_t seq_blocks = 16;
+  const std::size_t sequences = 2 * compute_blocks / seq_blocks;
+  const auto workload =
+      workload_oversubscribed(sequences, seq_blocks * cfg.block_tokens, 5);
+
+  std::printf("\ntiering under oversubscription");
+  std::printf("  (working set %zu blocks, compute %zu, spill %zu)\n",
+              sequences * seq_blocks, compute_blocks, spill_blocks);
+  std::printf("%-22s %10s %11s %11s %9s %9s\n", "configuration", "req/s", "hit rate",
+              "evicted", "demoted", "promoted");
+  std::printf("%s\n", std::string(78, '-').c_str());
+
+  CacheConfig single = cfg;
+  single.num_blocks = compute_blocks;
+  {
+    CacheManager cm(single);
+    print_tier_row("compute only", run_manager(cm, workload));
+  }
+  {
+    HostTier compute(compute_blocks * cfg.block_bytes());
+    HostTier spill(spill_blocks * cfg.block_bytes());
+    CacheManager cm({{&compute, compute_blocks}, {&spill, spill_blocks}}, cfg);
+    print_tier_row("compute + spill", run_manager(cm, workload));
+  }
+
+  // Read the columns together, not req/s alone. Evicting is free here because
+  // the benchmark never pays for the recompute an eviction causes in a real
+  // engine -- a prefill of this sequence length costs milliseconds of GPU time
+  // per miss. The tiered row pays its cost honestly: every demote and promote
+  // is a synchronous block copy on the acquire path, which is exactly the
+  // overlap-with-compute problem the async roadmap stage exists to remove.
+  std::printf(
+      "  (evictions cost nothing here; in a real engine each is a recompute.\n"
+      "   tiered migrations are synchronous copies on the request path.)\n");
+}
+
 void print_row(const std::string& name, const Result& r) {
   const double reqs_per_sec = r.seconds > 0 ? static_cast<double>(r.requests) / r.seconds : 0.0;
   const double us_per_req =
@@ -147,6 +233,8 @@ int main() {
   print_row("cold (no sharing)", run(cfg, workload_cold(20000, 512)));
   print_row("shared prefix 1k+64", run(cfg, workload_shared_prefix(20000, 1024, 64)));
   print_row("multi-turn 8x256", run(cfg, workload_multi_turn(2000, 8, 256)));
+
+  bench_tiering(cfg);
 
   return 0;
 }
