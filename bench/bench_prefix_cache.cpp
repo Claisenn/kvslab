@@ -187,16 +187,25 @@ void bench_tiering(const CacheConfig& cfg) {
     CacheManager cm({{&compute, compute_blocks}, {&spill, spill_blocks}}, cfg);
     print_tier_row("compute + spill", run_manager(cm, workload));
   }
+  {
+    HostTier compute(compute_blocks * cfg.block_bytes());
+    HostTier spill(spill_blocks * cfg.block_bytes());
+    // Keep a quarter of the compute tier free via background demotion, so
+    // requests find room waiting instead of copying on the acquire path.
+    CacheManager cm({{&compute, compute_blocks}, {&spill, spill_blocks}}, cfg,
+                    compute_blocks / 4);
+    print_tier_row("  + async watermark", run_manager(cm, workload));
+  }
 
   // Read the columns together, not req/s alone. Evicting is free here because
   // the benchmark never pays for the recompute an eviction causes in a real
   // engine -- a prefill of this sequence length costs milliseconds of GPU time
-  // per miss. The tiered row pays its cost honestly: every demote and promote
-  // is a synchronous block copy on the acquire path, which is exactly the
-  // overlap-with-compute problem the async roadmap stage exists to remove.
+  // per miss. The `demoted` column is the copies still paid on the acquire
+  // path; the watermark row moves most of them to the background worker, and
+  // what remains on-path is promotion, which prefetching would address next.
   std::printf(
       "  (evictions cost nothing here; in a real engine each is a recompute.\n"
-      "   tiered migrations are synchronous copies on the request path.)\n");
+      "   demoted = copies on the request path; promotions are always on it.)\n");
 }
 
 void print_row(const std::string& name, const Result& r) {

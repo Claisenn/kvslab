@@ -69,11 +69,13 @@ class RadixTree {
   // leaves. Returns how many blocks actually made it back to the free list.
   std::size_t evict(std::size_t num_blocks);
 
-  // Frees up to `num_slots` compute-tier slots by migrating the blocks of
-  // least-recently-used unpinned leaves to `dst_tier`. Unlike evict(), the
-  // cache entries survive: the index keeps naming the same block ids, which
-  // now resolve to the spill tier. Returns the number of slots freed.
-  std::size_t demote(std::size_t num_slots, std::uint32_t dst_tier);
+  // Collects up to `num_slots` compute-tier blocks from least-recently-used
+  // unpinned leaves -- the blocks a demotion should move, without moving them.
+  // Selection lives here because the tree owns recency and pins; what happens
+  // to the chosen blocks (synchronous copy, background copy) is the caller's
+  // policy. Skips blocks the tree does not own outright and blocks already
+  // migrating. Appends to `out` and returns how many were added.
+  std::size_t pick_demotion_victims(std::size_t num_slots, std::vector<BlockId>* out);
 
   // Pin/unpin `node` and every ancestor, so a sequence reading a cached prefix
   // cannot have it evicted out from under it mid-flight.

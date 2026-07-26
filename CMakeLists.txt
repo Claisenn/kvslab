@@ -34,6 +34,8 @@ add_library(kvslab
   src/cache_manager.cpp
 )
 target_include_directories(kvslab PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+find_package(Threads REQUIRED)
+target_link_libraries(kvslab PUBLIC Threads::Threads)
 target_compile_options(kvslab PRIVATE ${KVSLAB_WARNINGS})
 if(KVSLAB_ENABLE_ASSERTS)
   target_compile_options(kvslab PUBLIC ${KVSLAB_KEEP_ASSERTS})

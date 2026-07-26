@@ -635,6 +635,114 @@ TEST(cache_manager_falls_back_to_eviction_when_spill_is_full) {
   CHECK_EQ(cm.pool().num_used(), reachable_blocks(cm.tree()));
 }
 
+TEST(tiered_pool_async_demotion_moves_the_block_at_drain) {
+  const CacheConfig cfg = tiny_config(0);
+  HostTier compute(2 * cfg.block_bytes());
+  HostTier spill(2 * cfg.block_bytes());
+  BlockPool pool({{&compute, 2}, {&spill, 2}}, cfg);
+
+  const BlockId id = pool.allocate();
+  std::memset(pool.block_data(id), 0x7C, cfg.block_bytes());
+
+  CHECK(pool.demote_async(id, 1));
+  CHECK(pool.migrating(id));
+  // Until the drain observes the finished copy, the block has not moved: the
+  // engine can keep reading it in place.
+  CHECK_EQ(pool.block_tier(id), BlockPool::TierIndex{0});
+
+  pool.wait_for_migrations();
+  CHECK(!pool.migrating(id));
+  CHECK_EQ(pool.block_tier(id), BlockPool::TierIndex{1});
+  const auto* bytes = static_cast<const unsigned char*>(pool.block_data(id));
+  CHECK_EQ(bytes[cfg.block_bytes() - 1], static_cast<unsigned char>(0x7C));
+  CHECK_EQ(pool.tier_free(0), std::size_t{2});  // compute slot came back
+
+  pool.decref(id);
+}
+
+TEST(tiered_pool_cancelled_demotion_leaves_the_block_in_place) {
+  const CacheConfig cfg = tiny_config(0);
+  HostTier compute(2 * cfg.block_bytes());
+  HostTier spill(2 * cfg.block_bytes());
+  BlockPool pool({{&compute, 2}, {&spill, 2}}, cfg);
+
+  const BlockId id = pool.allocate();
+  CHECK(pool.demote_async(id, 1));
+  pool.cancel_migration(id);
+  CHECK(!pool.migrating(id));
+
+  pool.wait_for_migrations();
+  // The block never moved, and the reserved spill slot came back at drain.
+  CHECK_EQ(pool.block_tier(id), BlockPool::TierIndex{0});
+  CHECK_EQ(pool.tier_free(1), std::size_t{2});
+
+  // A block dying mid-flight takes its migration with it, and both slots end
+  // up free once the worker is done.
+  const BlockId dying = pool.allocate();
+  CHECK(pool.demote_async(dying, 1));
+  pool.decref(dying);
+  pool.decref(id);
+  pool.wait_for_migrations();
+  CHECK_EQ(pool.tier_free(0), std::size_t{2});
+  CHECK_EQ(pool.tier_free(1), std::size_t{2});
+  CHECK_EQ(pool.num_used(), std::size_t{0});
+}
+
+TEST(cache_manager_watermark_demotes_in_the_background) {
+  const CacheConfig cfg = tiny_config(0);
+  HostTier compute(4 * cfg.block_bytes());
+  HostTier spill(8 * cfg.block_bytes());
+  // Keep 2 compute slots free at all times.
+  CacheManager cm({{&compute, 4}, {&spill, 8}}, cfg, 2);
+
+  const std::vector<TokenId> a = iota_tokens(1, 8);
+  run_once(cm, a);  // 2 blocks cached, 2 free: exactly at the watermark
+  CHECK_EQ(cm.stats().background_demotions, std::uint64_t{0});
+
+  run_once(cm, iota_tokens(1000, 8));  // 0 free: 2 slots under
+  CHECK_EQ(cm.stats().background_demotions, std::uint64_t{2});
+
+  // The copies run off-path; once drained, the LRU entry lives in spill, its
+  // compute slots are free, and nothing was evicted or synchronously demoted.
+  cm.pool().wait_for_migrations();
+  CHECK_EQ(cm.pool().num_free(), std::size_t{2});
+  CHECK_EQ(cm.stats().demoted_blocks, std::uint64_t{0});
+  CHECK_EQ(cm.stats().evicted_blocks, std::uint64_t{0});
+
+  // The demoted entry is still a full hit, promoted back on access.
+  auto hit = cm.acquire(a);
+  CHECK(hit.ok);
+  CHECK_EQ(hit.cached_tokens, std::size_t{8});
+  CHECK_EQ(cm.stats().promoted_blocks, std::uint64_t{2});
+  cm.release(a, hit);
+  CHECK_EQ(cm.pool().num_used(), reachable_blocks(cm.tree()));
+}
+
+TEST(cache_manager_hit_cancels_an_inflight_demotion) {
+  const CacheConfig cfg = tiny_config(0);
+  HostTier compute(4 * cfg.block_bytes());
+  HostTier spill(8 * cfg.block_bytes());
+  CacheManager cm({{&compute, 4}, {&spill, 8}}, cfg, 4);  // aggressive watermark
+
+  const std::vector<TokenId> a = iota_tokens(1, 8);
+  run_once(cm, a);
+  // The watermark wants all 4 slots free, so a's blocks now have demotions in
+  // flight. Hitting a must yield blocks that stay in the compute tier.
+  auto hit = cm.acquire(a);
+  CHECK(hit.ok);
+  CHECK_EQ(hit.cached_tokens, std::size_t{8});
+  for (BlockId id : hit.blocks) {
+    CHECK(!cm.pool().migrating(id));
+    CHECK_EQ(cm.pool().block_tier(id), BlockPool::TierIndex{0});
+  }
+  cm.release(a, hit);
+
+  // Whatever the worker copied for the cancelled jobs is discarded; the
+  // reserved spill slots all come back.
+  cm.pool().wait_for_migrations();
+  CHECK_EQ(cm.pool().num_used(), reachable_blocks(cm.tree()));
+}
+
 TEST(cache_manager_leaks_no_blocks_across_a_mixed_workload) {
   CacheManager cm(tiny_config(32));
   const std::vector<TokenId> prompt = iota_tokens(1, 12);

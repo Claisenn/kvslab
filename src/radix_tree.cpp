@@ -276,35 +276,29 @@ std::size_t RadixTree::evict(std::size_t num_blocks) {
   return freed;
 }
 
-std::size_t RadixTree::demote(std::size_t num_slots, std::uint32_t dst_tier) {
-  std::size_t freed = 0;
+std::size_t RadixTree::pick_demotion_victims(std::size_t num_slots,
+                                             std::vector<BlockId>* out) {
+  const std::size_t before = out->size();
   std::vector<const Node*> rejected;
 
-  while (freed < num_slots) {
+  while (out->size() - before < num_slots) {
     Node* victim = find_lru_leaf(rejected);
     if (victim == nullptr) break;
 
-    // Move what this node has in the compute tier. Only sole-owned blocks: a
+    // Take what this node has in the compute tier. Only sole-owned blocks: a
     // block another sequence still holds is being read right now, and its
     // bytes must not move underneath that reader.
-    bool progress = false;
-    bool dst_full = false;
     for (BlockId id : victim->blocks) {
-      if (freed >= num_slots) break;
+      if (out->size() - before >= num_slots) break;
       if (pool_.block_tier(id) != 0) continue;
       if (pool_.refcount(id) != 1) continue;
-      if (!pool_.migrate(id, dst_tier)) {
-        dst_full = true;
-        break;
-      }
-      ++freed;
-      progress = true;
+      if (pool_.migrating(id)) continue;
+      out->push_back(id);
     }
-
-    if (dst_full) break;  // no destination slot will appear mid-call
-    if (!progress) rejected.push_back(victim);  // nothing here to move; look on
+    // Done with this node either way -- its eligible blocks are taken.
+    rejected.push_back(victim);
   }
-  return freed;
+  return out->size() - before;
 }
 
 void RadixTree::lock(Node* node) {

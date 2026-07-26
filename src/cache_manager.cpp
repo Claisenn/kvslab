@@ -60,8 +60,28 @@ CacheManager::CacheManager(const CacheConfig& cfg)
     : cfg_(cfg), pool_(cfg), tree_(pool_, cfg.block_tokens) {}
 
 CacheManager::CacheManager(const std::vector<BlockPool::TierSpec>& specs,
-                           const CacheConfig& cfg)
-    : cfg_(cfg), pool_(specs, cfg), tree_(pool_, cfg.block_tokens) {}
+                           const CacheConfig& cfg, std::size_t spill_watermark)
+    : cfg_(cfg),
+      pool_(specs, cfg),
+      tree_(pool_, cfg.block_tokens),
+      watermark_(spill_watermark) {}
+
+void CacheManager::maintain() {
+  if (pool_.num_tiers() < 2 || watermark_ == 0) return;
+
+  // Count in-flight demotions as free-to-be: each will hand back a compute
+  // slot at a future drain, and scheduling more for the same shortage would
+  // demote deeper into the working set than the watermark asks for.
+  const std::size_t projected = pool_.num_free() + pool_.pending_migrations();
+  if (projected >= watermark_) return;
+
+  victims_.clear();
+  tree_.pick_demotion_victims(watermark_ - projected, &victims_);
+  for (BlockId id : victims_) {
+    if (!pool_.demote_async(id, 1)) break;  // spill full; no point continuing
+    ++stats_.background_demotions;
+  }
+}
 
 CacheManager::Allocation CacheManager::acquire(const std::vector<TokenId>& tokens) {
   ++stats_.requests;
@@ -76,6 +96,10 @@ CacheManager::Allocation CacheManager::acquire(const std::vector<TokenId>& token
   const std::size_t bt = cfg_.block_tokens;
   const std::size_t need_blocks = (tokens.size() + bt - 1) / bt;
 
+  // Fold in any background copies that finished since the last call; their
+  // compute slots are this request's first source of room.
+  pool_.drain_migrations();
+
   RadixTree::MatchResult match = tree_.match_prefix(tokens);
   if (match.node != nullptr) {
     // Pin before doing anything that can evict, or the eviction below is free
@@ -86,6 +110,13 @@ CacheManager::Allocation CacheManager::acquire(const std::vector<TokenId>& token
   alloc.cached_tokens = match.num_tokens;
   alloc.cached_blocks = match.blocks.size();
   alloc.blocks = std::move(match.blocks);
+
+  // A matched block with a demotion in flight is about to be read; the move
+  // must not land after the block table is handed out. Cancelling keeps the
+  // block where it is -- it never left the compute tier.
+  for (BlockId id : alloc.blocks) {
+    pool_.cancel_migration(id);
+  }
 
   // Compute-tier demand: slots for the new blocks, plus one per matched block
   // currently in a spill tier -- the kernel reads from compute memory, so a
@@ -100,9 +131,14 @@ CacheManager::Allocation CacheManager::acquire(const std::vector<TokenId>& token
   if (pool_.num_free() < demand && pool_.num_tiers() > 1) {
     // Prefer demotion: it frees the same compute slots but keeps the entries,
     // so the cost is a future promotion instead of a recompute. The matched
-    // path is pinned and demote() skips pinned nodes, so it cannot move the
-    // very blocks this request is about to promote.
-    stats_.demoted_blocks += tree_.demote(demand - pool_.num_free(), 1);
+    // path is pinned and the picker skips pinned nodes, so it cannot choose
+    // the very blocks this request is about to promote.
+    victims_.clear();
+    tree_.pick_demotion_victims(demand - pool_.num_free(), &victims_);
+    for (BlockId id : victims_) {
+      if (!pool_.migrate(id, 1)) break;  // spill full; eviction is next
+      ++stats_.demoted_blocks;
+    }
   }
   while (pool_.num_free() < demand) {
     const std::size_t evicted = tree_.evict(demand - pool_.num_free());
@@ -141,6 +177,10 @@ CacheManager::Allocation CacheManager::acquire(const std::vector<TokenId>& token
   stats_.hit_tokens += alloc.cached_tokens;
   alloc.ok = true;
   alloc.owner_ = this;  // arms the handle: dropping it now gives the blocks back
+
+  // Start refilling the free headroom now, so the copies run while the engine
+  // computes against the table we just returned.
+  maintain();
   return alloc;
 }
 
@@ -163,6 +203,9 @@ void CacheManager::release(const std::vector<TokenId>& tokens, Allocation& alloc
   // disarm() rather than assigning a fresh handle: move-assignment would see
   // this one still armed and abandon it, releasing everything a second time.
   alloc.disarm();
+
+  pool_.drain_migrations();
+  maintain();
 }
 
 }  // namespace kvslab

@@ -1,8 +1,14 @@
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "kvslab/tier.hpp"
@@ -65,8 +71,42 @@ class BlockPool {
   // Moves the block's bytes to a free slot in `dst` and rebinds its location.
   // The id, refcount, and every pointer-free reference to the block stay
   // valid. Returns false when `dst` has no free slot; the block is untouched.
-  // Synchronous for now -- the async path is the next stage of the roadmap.
+  // Synchronous: the copy happens on the calling thread.
   bool migrate(BlockId id, TierIndex dst);
+
+  // --- Asynchronous migration -------------------------------------------
+  //
+  // The copy is the expensive half of a migration; the bookkeeping is a few
+  // list operations. These entry points split the two: the calling thread
+  // reserves the destination and hands the copy to a background worker, and
+  // the block's location changes only when a later drain_migrations() call
+  // observes the finished copy. Until then the block still lives -- and is
+  // still readable -- where it was.
+  //
+  // Every function here must be called from the same thread that drives the
+  // rest of the pool. The worker touches nothing but the job queue and the
+  // bytes; all bookkeeping stays externally synchronized, same as ever.
+
+  // Reserves a slot in `dst` and queues the copy. False when `dst` is full or
+  // the block already has a migration in flight.
+  bool demote_async(BlockId id, TierIndex dst);
+
+  // True while a queued or running migration exists for the block.
+  bool migrating(BlockId id) const;
+
+  // Abandons an in-flight migration. The block keeps its current location;
+  // the reserved destination slot is reclaimed once the worker is done with
+  // it. No-op if nothing is in flight.
+  void cancel_migration(BlockId id);
+
+  // Applies every migration whose copy has finished: rebinds locations and
+  // returns reserved slots from cancelled jobs. Cheap when nothing finished.
+  void drain_migrations();
+
+  // Blocks until the queue is empty, then drains. For tests and shutdown.
+  void wait_for_migrations();
+
+  std::size_t pending_migrations() const { return migrating_.size(); }
 
   // Byte offset of the block within its current tier's arena. Valid on every
   // tier; the offset is only meaningful together with block_tier().
@@ -91,6 +131,9 @@ class BlockPool {
   std::size_t num_used() const { return location_.size() - free_ids_.size(); }
   const CacheConfig& config() const { return cfg_; }
 
+ public:
+  ~BlockPool();
+
  private:
   struct TierState {
     Tier* tier = nullptr;
@@ -103,8 +146,24 @@ class BlockPool {
     std::uint32_t slot = 0;
   };
 
+  // One queued copy. The scheduler thread owns everything except `done`,
+  // which the worker sets, and `cancelled`, which the worker reads to skip
+  // work; src/dst pointers are immutable once queued.
+  struct MigrationJob {
+    BlockId id = kInvalidBlock;
+    TierIndex dst_tier = 0;
+    std::uint32_t dst_slot = 0;
+    const std::byte* src = nullptr;
+    std::byte* dst = nullptr;
+    std::size_t bytes = 0;
+    std::atomic<bool> done{false};
+    std::atomic<bool> cancelled{false};
+  };
+
   void init(const std::vector<TierSpec>& specs);
   const Location& locate(BlockId id) const;
+  void worker_loop();
+  void ensure_worker();
 
   CacheConfig cfg_;
   std::unique_ptr<HostTier> owned_tier_;  // non-null only for the owning ctor
@@ -113,6 +172,17 @@ class BlockPool {
   std::vector<std::uint32_t> refcount_;   // indexed by BlockId
   std::vector<BlockId> free_ids_;
   std::vector<std::byte> bounce_;         // scratch for tier-to-tier copies
+
+  // Jobs in queue order; the worker completes them front to back. The map is
+  // the "in flight" flag: a block is migrating iff its id is a key.
+  std::deque<std::unique_ptr<MigrationJob>> jobs_;
+  std::unordered_map<BlockId, MigrationJob*> migrating_;
+
+  std::thread worker_;
+  std::mutex queue_mutex_;
+  std::condition_variable queue_cv_;
+  std::size_t next_unclaimed_ = 0;  // guarded by queue_mutex_: worker's cursor
+  bool stopping_ = false;           // guarded by queue_mutex_
 };
 
 }  // namespace kvslab

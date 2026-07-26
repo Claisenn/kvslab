@@ -63,8 +63,9 @@ class CacheManager {
     std::uint64_t total_tokens = 0;    // tokens across served requests
     std::uint64_t hit_tokens = 0;      // of those, the ones cache supplied
     std::uint64_t evicted_blocks = 0;
-    std::uint64_t demoted_blocks = 0;   // moved to spill instead of dropped
-    std::uint64_t promoted_blocks = 0;  // brought back to compute on a hit
+    std::uint64_t demoted_blocks = 0;      // moved to spill on the request path
+    std::uint64_t background_demotions = 0;  // copies handed to the worker
+    std::uint64_t promoted_blocks = 0;     // brought back to compute on a hit
     std::uint64_t alloc_failures = 0;
     std::uint64_t abandoned = 0;  // handles destroyed without release()
 
@@ -88,7 +89,13 @@ class CacheManager {
   // Tiered: specs[0] is the compute tier, specs[1] the spill tier cold
   // entries demote into instead of being dropped. Tiers are borrowed and must
   // outlive the manager.
-  CacheManager(const std::vector<BlockPool::TierSpec>& specs, const CacheConfig& cfg);
+  //
+  // `spill_watermark` is the number of compute slots the manager tries to keep
+  // free by demoting cold entries in the background, so requests find room
+  // waiting instead of paying for a copy on the acquire path. Zero disables
+  // background demotion; pressure is then relieved synchronously, on demand.
+  CacheManager(const std::vector<BlockPool::TierSpec>& specs, const CacheConfig& cfg,
+               std::size_t spill_watermark = 0);
 
   Allocation acquire(const std::vector<TokenId>& tokens);
   void release(const std::vector<TokenId>& tokens, Allocation& alloc);
@@ -101,11 +108,16 @@ class CacheManager {
  private:
   // Hand back what a destroyed handle still holds, without publishing it.
   void abandon(Allocation& alloc);
+  // Top the compute tier's free slots back up to the watermark by scheduling
+  // background demotions. Runs after every acquire and release.
+  void maintain();
 
   CacheConfig cfg_;
   BlockPool pool_;
   RadixTree tree_;
   Stats stats_;
+  std::size_t watermark_ = 0;
+  std::vector<BlockId> victims_;  // scratch for demotion picks
 };
 
 }  // namespace kvslab

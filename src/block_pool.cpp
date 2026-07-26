@@ -75,6 +75,136 @@ void BlockPool::init(const std::vector<TierSpec>& specs) {
   bounce_.resize(cfg_.block_bytes());
 }
 
+BlockPool::~BlockPool() {
+  {
+    std::lock_guard<std::mutex> lk(queue_mutex_);
+    stopping_ = true;
+  }
+  queue_cv_.notify_all();
+  if (worker_.joinable()) worker_.join();
+  // Unfinished jobs die with the pool; the tiers outlive it by contract, and
+  // nothing will ever observe the locations that were never rebound.
+}
+
+void BlockPool::ensure_worker() {
+  if (worker_.joinable()) return;
+  worker_ = std::thread([this] { worker_loop(); });
+}
+
+void BlockPool::worker_loop() {
+  std::unique_lock<std::mutex> lk(queue_mutex_);
+  while (true) {
+    queue_cv_.wait(lk, [&] { return stopping_ || next_unclaimed_ < jobs_.size(); });
+    if (stopping_) return;
+
+    MigrationJob* job = jobs_[next_unclaimed_].get();
+    ++next_unclaimed_;
+    lk.unlock();
+
+    // A cancelled job skips the copy but still completes: its reserved
+    // destination slot is handed back at the next drain, not here, so the
+    // scheduler never sees a slot freed by another thread.
+    if (!job->cancelled.load(std::memory_order_acquire)) {
+      std::memcpy(job->dst, job->src, job->bytes);
+    }
+    job->done.store(true, std::memory_order_release);
+    queue_cv_.notify_all();
+
+    lk.lock();
+  }
+}
+
+bool BlockPool::demote_async(BlockId id, TierIndex dst) {
+  const Location& loc = locate(id);
+  if (dst >= tiers_.size()) fatal("async demote to an out-of-range tier", id);
+  if (loc.tier == dst) return false;
+  if (migrating_.find(id) != migrating_.end()) return false;
+  if (tiers_[dst].free_slots.empty()) return false;
+
+  // The worker copies through raw pointers, so both ends must be
+  // host-addressable. A device tier will need the worker to speak the Tier
+  // interface; until one exists, callers fall back to synchronous migrate().
+  std::byte* src_base = tiers_[loc.tier].tier->host_data();
+  std::byte* dst_base = tiers_[dst].tier->host_data();
+  if (src_base == nullptr || dst_base == nullptr) return false;
+
+  auto job = std::make_unique<MigrationJob>();
+  job->id = id;
+  job->dst_tier = dst;
+  job->dst_slot = tiers_[dst].free_slots.back();
+  tiers_[dst].free_slots.pop_back();
+  job->bytes = cfg_.block_bytes();
+  job->src = src_base + static_cast<std::size_t>(loc.slot) * job->bytes;
+  job->dst = dst_base + static_cast<std::size_t>(job->dst_slot) * job->bytes;
+
+  migrating_.emplace(id, job.get());
+  {
+    std::lock_guard<std::mutex> lk(queue_mutex_);
+    jobs_.push_back(std::move(job));
+  }
+  ensure_worker();
+  queue_cv_.notify_one();
+  return true;
+}
+
+bool BlockPool::migrating(BlockId id) const {
+  return migrating_.find(id) != migrating_.end();
+}
+
+void BlockPool::cancel_migration(BlockId id) {
+  auto it = migrating_.find(id);
+  if (it == migrating_.end()) return;
+  // The block never moves: its location was untouched while the job was in
+  // flight. The job stays queued so the worker can finish with the reserved
+  // destination slot, which drain_migrations() then reclaims.
+  it->second->cancelled.store(true, std::memory_order_release);
+  migrating_.erase(it);
+}
+
+void BlockPool::drain_migrations() {
+  // Unlocked fast path: the deque is only ever mutated on this thread (the
+  // worker reads entries but never adds or removes them), so observing it
+  // empty needs no lock. Keeps the single-tier request path mutex-free.
+  if (jobs_.empty()) return;
+
+  std::vector<std::unique_ptr<MigrationJob>> finished;
+  {
+    std::lock_guard<std::mutex> lk(queue_mutex_);
+    while (!jobs_.empty() && jobs_.front()->done.load(std::memory_order_acquire)) {
+      finished.push_back(std::move(jobs_.front()));
+      jobs_.pop_front();
+      --next_unclaimed_;  // done implies claimed, so the cursor covers the front
+    }
+  }
+
+  for (const auto& job : finished) {
+    if (job->cancelled.load(std::memory_order_acquire)) {
+      tiers_[job->dst_tier].free_slots.push_back(job->dst_slot);
+      continue;
+    }
+    // An uncancelled finished job implies the block is still allocated and
+    // still where it was: decref-to-zero and sync migrate both cancel first.
+    Location& loc = location_[job->id];
+    tiers_[loc.tier].free_slots.push_back(loc.slot);
+    loc.tier = job->dst_tier;
+    loc.slot = job->dst_slot;
+    migrating_.erase(job->id);
+  }
+}
+
+void BlockPool::wait_for_migrations() {
+  {
+    std::unique_lock<std::mutex> lk(queue_mutex_);
+    queue_cv_.wait(lk, [&] {
+      for (const auto& job : jobs_) {
+        if (!job->done.load(std::memory_order_acquire)) return false;
+      }
+      return true;
+    });
+  }
+  drain_migrations();
+}
+
 const BlockPool::Location& BlockPool::locate(BlockId id) const {
   if (id >= location_.size()) fatal("access to an out-of-range block", id);
   if (refcount_[id] == 0) fatal("access to a block that is not allocated", id);
@@ -106,6 +236,10 @@ bool BlockPool::decref(BlockId id) {
   if (id >= location_.size()) fatal("decref of an out-of-range block", id);
   if (refcount_[id] == 0) fatal("decref of a block that is already free", id);
   if (--refcount_[id] == 0) {
+    // A dying block takes any in-flight migration with it. The freed source
+    // slot may be reallocated while the worker still reads it -- a torn copy
+    // into a destination that is discarded at drain, which is harmless.
+    cancel_migration(id);
     const Location& loc = location_[id];
     tiers_[loc.tier].free_slots.push_back(loc.slot);
     free_ids_.push_back(id);
@@ -124,6 +258,10 @@ BlockPool::TierIndex BlockPool::block_tier(BlockId id) const {
 }
 
 bool BlockPool::migrate(BlockId id, TierIndex dst) {
+  // A synchronous move supersedes a queued one; the stale job's copy targets
+  // a still-reserved slot and is discarded at drain.
+  cancel_migration(id);
+
   const Location& loc = locate(id);
   if (dst >= tiers_.size()) fatal("migrate to an out-of-range tier", id);
   if (loc.tier == dst) return true;  // already there
