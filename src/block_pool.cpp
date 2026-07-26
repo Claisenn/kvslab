@@ -1,9 +1,24 @@
 #include "kvslab/block_pool.hpp"
 
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace kvslab {
+namespace {
+
+// Refcount and range violations are not crashes, they are silent corruption: a
+// block handed back twice lands on the free list while the index still points
+// at it, and the next allocation gives live KV to a second sequence. Nothing
+// downstream can detect that, so these checks do not ride on assert() -- they
+// stay in every build, at the cost of a branch that always predicts.
+[[noreturn]] void fatal(const char* what, BlockId id) {
+  std::fprintf(stderr, "kvslab: fatal: %s (block %u)\n", what, id);
+  std::abort();
+}
+
+}  // namespace
 
 BlockPool::BlockPool(const CacheConfig& cfg)
     : cfg_(cfg),
@@ -40,14 +55,14 @@ BlockId BlockPool::allocate() {
 }
 
 void BlockPool::incref(BlockId id) {
-  assert(id < cfg_.num_blocks);
-  assert(refcount_[id] > 0 && "reviving a freed block");
+  if (id >= cfg_.num_blocks) fatal("incref of an out-of-range block", id);
+  if (refcount_[id] == 0) fatal("incref of a block that is already free", id);
   ++refcount_[id];
 }
 
 bool BlockPool::decref(BlockId id) {
-  assert(id < cfg_.num_blocks);
-  assert(refcount_[id] > 0 && "double free");
+  if (id >= cfg_.num_blocks) fatal("decref of an out-of-range block", id);
+  if (refcount_[id] == 0) fatal("decref of a block that is already free", id);
   if (--refcount_[id] == 0) {
     free_list_.push_back(id);
     return true;
@@ -56,12 +71,12 @@ bool BlockPool::decref(BlockId id) {
 }
 
 std::uint32_t BlockPool::refcount(BlockId id) const {
-  assert(id < cfg_.num_blocks);
+  if (id >= cfg_.num_blocks) fatal("refcount of an out-of-range block", id);
   return refcount_[id];
 }
 
 std::size_t BlockPool::block_offset(BlockId id) const {
-  assert(id < cfg_.num_blocks);
+  if (id >= cfg_.num_blocks) fatal("offset of an out-of-range block", id);
   return static_cast<std::size_t>(id) * cfg_.block_bytes();
 }
 

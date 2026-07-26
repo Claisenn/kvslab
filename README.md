@@ -72,10 +72,12 @@ cmake --build build-release -j
 ./build-release/bench_prefix_cache
 ```
 
-Requires only a C++20 compiler and CMake 3.16+. `assert()` stays live in
-optimized builds by default (`-DKVSLAB_ENABLE_ASSERTS=OFF` to disable) — the
-invariants it guards are refcount and pin balance, which otherwise fail
-silently.
+Block refcount and range checks are unconditional. Violating one is not a crash
+but silent corruption — a block handed back twice lands on the free list while
+the index still points at it — and nothing downstream can detect that, so they
+are not worth trading away for a branch. The remaining invariants, chiefly pin
+balance and block alignment, ride on `assert()`, which stays live in optimized
+builds by default; `-DKVSLAB_ENABLE_ASSERTS=OFF` turns those off.
 
 ## Roadmap
 
