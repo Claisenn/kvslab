@@ -400,6 +400,13 @@ TEST(cache_manager_refuses_when_every_candidate_is_pinned) {
   auto blocked = cm.acquire(big);
   CHECK(!blocked.ok);
   CHECK_EQ(cm.stats().alloc_failures, std::uint64_t{1});
+  // The failure is counted as a request but not as a served one, and its tokens
+  // stay out of the hit rate entirely -- it served nothing, so charging its
+  // tokens to the denominator would blame the cache for a capacity shortfall.
+  CHECK_EQ(cm.stats().requests, cm.stats().served + cm.stats().alloc_failures);
+  // Two served requests, 8 tokens each, the second one entirely from cache.
+  CHECK_EQ(cm.stats().total_tokens, std::uint64_t{16});
+  CHECK_EQ(cm.stats().hit_rate(), 0.5);
   // Failing must not have handed out the pinned blocks or leaked new ones.
   CHECK_EQ(cm.pool().refcount(held.blocks[0]), std::uint32_t{1});
 

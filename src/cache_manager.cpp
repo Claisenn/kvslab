@@ -9,10 +9,10 @@ CacheManager::CacheManager(const CacheConfig& cfg)
 
 CacheManager::Allocation CacheManager::acquire(const std::vector<TokenId>& tokens) {
   ++stats_.requests;
-  stats_.total_tokens += tokens.size();
 
   Allocation alloc;
   if (tokens.empty()) {
+    ++stats_.served;
     alloc.ok = true;
     return alloc;
   }
@@ -50,6 +50,10 @@ CacheManager::Allocation CacheManager::acquire(const std::vector<TokenId>& token
     alloc.blocks.push_back(id);
   }
 
+  // Counted here rather than at entry so the hit rate's numerator and
+  // denominator describe the same set of requests.
+  ++stats_.served;
+  stats_.total_tokens += tokens.size();
   stats_.hit_tokens += alloc.cached_tokens;
   alloc.ok = true;
   return alloc;

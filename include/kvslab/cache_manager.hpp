@@ -43,12 +43,19 @@ class CacheManager {
   };
 
   struct Stats {
-    std::uint64_t requests = 0;
-    std::uint64_t total_tokens = 0;
-    std::uint64_t hit_tokens = 0;
+    std::uint64_t requests = 0;        // every acquire(), served or not
+    std::uint64_t served = 0;          // those that returned a block table
+    std::uint64_t total_tokens = 0;    // tokens across served requests
+    std::uint64_t hit_tokens = 0;      // of those, the ones cache supplied
     std::uint64_t evicted_blocks = 0;
     std::uint64_t alloc_failures = 0;
 
+    // Share of served tokens that came from cache.
+    //
+    // A failed acquisition contributes to neither side. It served nothing, so
+    // counting its tokens in the denominator alone would report a hit-rate
+    // collapse for what is really a capacity problem -- and capacity already
+    // has its own number in alloc_failures.
     double hit_rate() const {
       return total_tokens == 0 ? 0.0
                                : static_cast<double>(hit_tokens) /
