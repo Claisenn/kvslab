@@ -24,3 +24,11 @@ target_compile_options(kvslab PRIVATE -Wall -Wextra -Wpedantic)
 if(KVSLAB_ENABLE_ASSERTS)
   target_compile_options(kvslab PUBLIC -UNDEBUG)
 endif()
+
+enable_testing()
+
+add_executable(kvslab_tests tests/test_kvslab.cpp)
+target_link_libraries(kvslab_tests PRIVATE kvslab)
+target_include_directories(kvslab_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_compile_options(kvslab_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME kvslab_tests COMMAND kvslab_tests)
