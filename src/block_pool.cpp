@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 
 namespace kvslab {
@@ -137,11 +138,18 @@ bool BlockPool::migrate(BlockId id, TierIndex dst) {
   tiers_[dst].free_slots.pop_back();
   const std::size_t dst_off = static_cast<std::size_t>(dst_slot) * bytes;
 
-  // Through the bounce buffer, which works for any tier pairing. A direct
-  // path for host<->host (or device peer copies) is an optimization for when
-  // a profile asks for it.
-  src_tier.read(src_off, bounce_.data(), bytes);
-  dst_tier.write(dst_off, bounce_.data(), bytes);
+  // One copy when both sides are host-addressable, which every tier today is;
+  // the bounce buffer stays as the fallback that works for any pairing. The
+  // tiering benchmark moves 64 MiB per request at the default geometry, so the
+  // halved traffic is worth the branch.
+  std::byte* src_base = src_tier.host_data();
+  std::byte* dst_base = dst_tier.host_data();
+  if (src_base != nullptr && dst_base != nullptr) {
+    std::memcpy(dst_base + dst_off, src_base + src_off, bytes);
+  } else {
+    src_tier.read(src_off, bounce_.data(), bytes);
+    dst_tier.write(dst_off, bounce_.data(), bytes);
+  }
 
   tiers_[loc.tier].free_slots.push_back(loc.slot);
   location_[id].tier = dst;
