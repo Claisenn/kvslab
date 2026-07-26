@@ -150,6 +150,73 @@ TEST(block_pool_allocates_and_recycles) {
   CHECK_EQ(pool.num_free(), std::size_t{1});
 }
 
+TEST(tiered_pool_migrates_blocks_without_changing_their_identity) {
+  const CacheConfig cfg = tiny_config(0);  // geometry only; capacity is per tier
+  HostTier compute(4 * cfg.block_bytes());
+  HostTier spill(8 * cfg.block_bytes());
+  BlockPool pool({{&compute, 4}, {&spill, 8}}, cfg);
+
+  CHECK_EQ(pool.num_tiers(), std::size_t{2});
+  CHECK_EQ(pool.num_blocks(), std::size_t{12});
+  CHECK_EQ(pool.num_free(), std::size_t{4});  // allocatable = compute tier only
+
+  const BlockId id = pool.allocate();
+  CHECK_EQ(pool.block_tier(id), BlockPool::TierIndex{0});
+
+  // Fill the block with a pattern, demote it, and the bytes must follow.
+  std::memset(pool.block_data(id), 0x5A, cfg.block_bytes());
+  CHECK(pool.migrate(id, 1));
+  CHECK_EQ(pool.block_tier(id), BlockPool::TierIndex{1});
+  const auto* bytes = static_cast<const unsigned char*>(pool.block_data(id));
+  CHECK(bytes >= reinterpret_cast<unsigned char*>(spill.host_data()));
+  CHECK_EQ(bytes[0], static_cast<unsigned char>(0x5A));
+  CHECK_EQ(bytes[cfg.block_bytes() - 1], static_cast<unsigned char>(0x5A));
+
+  // Identity survived: same id, same refcount, and its compute slot is free
+  // for someone else while the id itself still counts as used.
+  CHECK_EQ(pool.refcount(id), std::uint32_t{1});
+  CHECK_EQ(pool.tier_free(0), std::size_t{4});
+  CHECK_EQ(pool.num_used(), std::size_t{1});
+
+  // Promote it back; the pattern must survive the round trip.
+  CHECK(pool.migrate(id, 0));
+  CHECK_EQ(pool.block_tier(id), BlockPool::TierIndex{0});
+  const auto* back = static_cast<const unsigned char*>(pool.block_data(id));
+  CHECK_EQ(back[cfg.block_bytes() - 1], static_cast<unsigned char>(0x5A));
+
+  pool.decref(id);
+}
+
+TEST(tiered_pool_frees_compute_capacity_by_demoting) {
+  const CacheConfig cfg = tiny_config(0);
+  HostTier compute(2 * cfg.block_bytes());
+  HostTier spill(2 * cfg.block_bytes());
+  BlockPool pool({{&compute, 2}, {&spill, 2}}, cfg);
+
+  const BlockId a = pool.allocate();
+  const BlockId b = pool.allocate();
+  CHECK(pool.allocate() == kInvalidBlock);  // compute full; spill can't help
+
+  // Demoting one block is exactly what makes the next allocation possible.
+  CHECK(pool.migrate(a, 1));
+  const BlockId c = pool.allocate();
+  CHECK(c != kInvalidBlock);
+
+  // Spill holds one block and has one slot left; a second demotion fills it
+  // and a third must be refused without disturbing the block.
+  CHECK(pool.migrate(b, 1));
+  CHECK(!pool.migrate(c, 1));
+  CHECK_EQ(pool.block_tier(c), BlockPool::TierIndex{0});
+
+  // A freed spill-resident block returns its slot to the spill tier.
+  pool.decref(a);
+  CHECK_EQ(pool.tier_free(1), std::size_t{1});
+
+  pool.decref(b);
+  pool.decref(c);
+  CHECK_EQ(pool.num_used(), std::size_t{0});
+}
+
 TEST(radix_tree_matches_an_exact_sequence) {
   BlockPool pool(tiny_config(64));
   RadixTree tree(pool, 4);
