@@ -187,12 +187,38 @@ std::size_t RadixTree::insert(const std::vector<TokenId>& tokens,
   return adopted;
 }
 
-// Least-recently-used unpinned leaf, or nullptr when everything is pinned.
+// True when the tree holds the only reference to every block in the node, so
+// dropping it actually puts them back on the free list.
+bool RadixTree::tree_is_sole_owner(const Node* node) const {
+  for (BlockId id : node->blocks) {
+    if (pool_.refcount(id) != 1) return false;
+  }
+  return true;
+}
+
+std::size_t RadixTree::drop_leaf(Node* victim) {
+  std::size_t freed = 0;
+  for (BlockId id : victim->blocks) {
+    if (pool_.decref(id)) ++freed;
+  }
+  stored_blocks_ -= victim->blocks.size();
+  --num_nodes_;
+
+  Node* parent = victim->parent;
+  const std::uint64_t key = block_key(victim->tokens.data(), block_tokens_);
+  parent->children.erase(key);  // victim dies here
+  return freed;
+}
+
+// Least-recently-used unpinned leaf, ignoring any node already rejected by the
+// caller. Interior nodes are skipped because their blocks are the shared head
+// of a longer cached sequence; pinned nodes because an in-flight request is
+// reading them.
 //
-// This is a full walk per eviction -- O(nodes) where an intrusive LRU list
-// would be O(1). Correct first, and the profile says eviction is nowhere near
-// the hot path at these pool sizes; see the roadmap.
-RadixTree::Node* RadixTree::find_lru_leaf() {
+// This is a full walk per victim -- O(nodes) where an intrusive LRU list would
+// be O(1). Correct first; see the roadmap. `rejected` is scanned linearly, but
+// it is empty on every ordinary eviction.
+RadixTree::Node* RadixTree::find_lru_leaf(const std::vector<const Node*>& rejected) {
   Node* best = nullptr;
   std::vector<Node*> stack{root_.get()};
   while (!stack.empty()) {
@@ -201,8 +227,9 @@ RadixTree::Node* RadixTree::find_lru_leaf() {
     for (auto& [key, child] : node->children) stack.push_back(child.get());
 
     if (node == root_.get()) continue;
-    if (!node->children.empty()) continue;  // interior nodes hold live prefixes
+    if (!node->children.empty()) continue;
     if (node->lock_count > 0) continue;
+    if (std::find(rejected.begin(), rejected.end(), node) != rejected.end()) continue;
     if (best == nullptr || node->last_access < best->last_access) best = node;
   }
   return best;
@@ -210,19 +237,29 @@ RadixTree::Node* RadixTree::find_lru_leaf() {
 
 std::size_t RadixTree::evict(std::size_t num_blocks) {
   std::size_t freed = 0;
+  // Ownership is checked on the chosen victim rather than on every candidate
+  // during the walk: the check costs one refcount lookup per block, so folding
+  // it into the scan would turn an O(nodes) walk into an O(blocks) one for a
+  // condition that virtually never holds.
+  std::vector<const Node*> rejected;
+
   while (freed < num_blocks) {
-    Node* victim = find_lru_leaf();
-    if (victim == nullptr) break;  // everything left is pinned or interior
+    Node* victim = find_lru_leaf(rejected);
+    if (victim == nullptr) break;
 
-    for (BlockId id : victim->blocks) {
-      if (pool_.decref(id)) ++freed;
+    if (!tree_is_sole_owner(victim)) {
+      // Dropping this would free nothing and orphan its blocks -- the tree is
+      // the only thing that could ever hand them back. Leave it and look
+      // further down the LRU order.
+      rejected.push_back(victim);
+      continue;
     }
-    stored_blocks_ -= victim->blocks.size();
-    --num_nodes_;
 
-    Node* parent = victim->parent;
-    const std::uint64_t key = block_key(victim->tokens.data(), block_tokens_);
-    parent->children.erase(key);  // victim dies here
+    const std::size_t reclaimed = drop_leaf(victim);
+    // A node always holds at least one block, and the check above proved the
+    // tree owns them all. Without this the loop could spin.
+    assert(reclaimed > 0 && "a sole-owner leaf freed nothing");
+    freed += reclaimed;
   }
   return freed;
 }

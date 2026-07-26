@@ -225,6 +225,30 @@ TEST(radix_tree_evicts_the_least_recently_used_prefix) {
   CHECK_EQ(tree.match_prefix(hot).num_tokens, std::size_t{8});
 }
 
+TEST(radix_tree_eviction_leaves_blocks_that_are_still_held) {
+  BlockPool pool(tiny_config(8));
+  RadixTree tree(pool, 4);
+
+  // Publish without dropping our own references, exactly like a sequence still
+  // in flight: the tree and this test each hold every block.
+  const std::vector<TokenId> held = iota_tokens(1, 8);
+  std::vector<BlockId> ids;
+  for (int i = 0; i < 2; ++i) ids.push_back(pool.allocate());
+  tree.insert(held, ids);
+
+  // A second sequence the tree owns outright.
+  publish(tree, pool, iota_tokens(1000, 8));
+  CHECK_EQ(tree.stored_blocks(), std::size_t{4});
+
+  // Only the fully-owned sequence is reclaimable. Dropping the held one would
+  // free nothing and strand its blocks, so it has to survive the sweep.
+  CHECK_EQ(tree.evict(4), std::size_t{2});
+  CHECK_EQ(tree.stored_blocks(), std::size_t{2});
+  CHECK_EQ(tree.match_prefix(held).num_tokens, std::size_t{8});
+
+  for (BlockId id : ids) pool.decref(id);
+}
+
 TEST(radix_tree_pin_protects_a_prefix_from_eviction) {
   BlockPool pool(tiny_config(4));
   RadixTree tree(pool, 4);

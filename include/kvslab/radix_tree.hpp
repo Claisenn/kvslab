@@ -79,7 +79,9 @@ class RadixTree {
 
  private:
   Node* split_node(Node* node, std::size_t offset);
-  Node* find_lru_leaf();
+  Node* find_lru_leaf(const std::vector<const Node*>& rejected);
+  bool tree_is_sole_owner(const Node* node) const;
+  std::size_t drop_leaf(Node* victim);
   void touch(Node* node) { node->last_access = ++clock_; }
   void release_blocks(Node* node);
 
