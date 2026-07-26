@@ -344,6 +344,9 @@ TEST(cache_manager_leaks_no_blocks_across_a_mixed_workload) {
   // Every block still allocated must be one the index owns; anything else is a
   // sequence that failed to give its blocks back.
   CHECK_EQ(cm.pool().num_used(), cm.tree().stored_blocks());
+  // No entry should have been refused: a collision here would mean the 64-bit
+  // block key is doing far worse than chance on a 20-sequence workload.
+  CHECK_EQ(cm.tree().hash_collisions(), std::size_t{0});
 }
 
 int main() { return kvcheck::run_all(); }

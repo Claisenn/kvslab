@@ -33,9 +33,12 @@ struct CacheConfig {
 // FNV-1a over one block's worth of token ids. The prefix tree keys its children
 // by whole blocks rather than single tokens: the tree is block aligned, so a
 // divergence *inside* a block has to produce two distinct children, and a
-// per-token key cannot express that. Hash equality is always confirmed by a
-// full token comparison at the call site, so collisions cost a miss, not
-// correctness.
+// per-token key cannot express that.
+//
+// Equality of the key is never trusted on its own -- a match is confirmed by
+// comparing the tokens themselves, and an insert whose key is already taken by
+// a different block is refused rather than overwriting it. A collision
+// therefore costs a cache entry, never correctness.
 inline std::uint64_t block_key(const TokenId* tokens, std::size_t n) {
   std::uint64_t h = 1469598103934665603ull;
   for (std::size_t i = 0; i < n; ++i) {

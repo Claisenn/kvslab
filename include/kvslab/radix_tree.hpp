@@ -71,6 +71,10 @@ class RadixTree {
 
   std::size_t stored_blocks() const { return stored_blocks_; }
   std::size_t num_nodes() const { return num_nodes_; }
+  // Inserts refused because another block already occupied the hash slot.
+  // Expected to stay at zero; a non-zero value means the index is silently
+  // losing cache entries and the key width deserves a second look.
+  std::size_t hash_collisions() const { return collisions_; }
   const Node* root() const { return root_.get(); }
 
  private:
@@ -85,6 +89,7 @@ class RadixTree {
   std::uint64_t clock_ = 0;
   std::size_t stored_blocks_ = 0;
   std::size_t num_nodes_ = 0;
+  std::size_t collisions_ = 0;
 };
 
 }  // namespace kvslab

@@ -158,6 +158,20 @@ std::size_t RadixTree::insert(const std::vector<TokenId>& tokens,
     return 0;  // fully cached already; caller's blocks are redundant
   }
 
+  const std::uint64_t key = block_key(tokens.data() + pos, block_tokens_);
+  if (cur->children.find(key) != cur->children.end()) {
+    // The walk above stopped without consuming this child, so the slot is held
+    // by a block whose tokens differ from ours: a hash collision.
+    //
+    // Storing anyway would overwrite the existing child. That subtree's blocks
+    // would lose their only owner and could never return to the free list, the
+    // node counters would drift, and any pin reaching into it would dangle.
+    // Refusing costs this sequence its cache entry, which is the right trade
+    // against corrupting the index.
+    ++collisions_;
+    return 0;
+  }
+
   auto leaf = std::make_unique<Node>();
   leaf->tokens.assign(tokens.begin() + pos, tokens.begin() + limit);
   leaf->blocks.assign(blocks.begin() + pos / block_tokens_,
@@ -167,8 +181,7 @@ std::size_t RadixTree::insert(const std::vector<TokenId>& tokens,
   for (BlockId id : leaf->blocks) pool_.incref(id);
 
   const std::size_t adopted = leaf->blocks.size();
-  const std::uint64_t key = block_key(leaf->tokens.data(), block_tokens_);
-  cur->children[key] = std::move(leaf);
+  cur->children.emplace(key, std::move(leaf));
   stored_blocks_ += adopted;
   ++num_nodes_;
   return adopted;

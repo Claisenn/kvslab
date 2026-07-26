@@ -38,8 +38,12 @@ token sequence, get back a block table.
 *Children are keyed by the hash of a whole block of tokens, not by a single
 token.* The tree is block aligned, so two sequences diverging in the middle of a
 block must land in separate children, and a per-token key cannot express that.
-Hash equality is always confirmed by a full token comparison, so a collision
-costs a cache miss, never correctness.
+Equality of the key is never trusted on its own: a match is confirmed by
+comparing the tokens themselves, and an insert whose key is already taken by a
+different block is refused rather than overwriting it — overwriting would strand
+that subtree's blocks with no owner to return them to the free list. A collision
+therefore costs a cache entry, never correctness, and `hash_collisions()`
+reports how many have been seen.
 
 *Splitting a node interposes a new **parent**, not a new child.* Callers hold
 node pointers as pins across a request's lifetime. Keeping the original object
