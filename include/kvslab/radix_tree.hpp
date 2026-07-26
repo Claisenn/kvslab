@@ -30,6 +30,10 @@ class RadixTree {
     std::vector<BlockId> blocks;  // tokens.size() / block_tokens entries
     std::unordered_map<std::uint64_t, std::unique_ptr<Node>> children;
     Node* parent = nullptr;
+    // Number of in-flight sequences whose matched path passes through this
+    // node. Non-zero means "pinned": eviction must not touch it.
+    std::uint32_t lock_count = 0;
+    std::uint64_t last_access = 0;  // logical clock, for LRU
   };
 
   struct MatchResult {
@@ -46,7 +50,7 @@ class RadixTree {
 
   // Longest block-aligned prefix of `tokens` already in the tree. Splits the
   // deepest node when the match ends inside it, so the returned node covers the
-  // match and nothing more.
+  // match and nothing more -- pinning it pins precisely the reused blocks.
   MatchResult match_prefix(const std::vector<TokenId>& tokens);
 
   // Stores whatever block-aligned suffix of `tokens` is not present yet, taking
@@ -56,17 +60,29 @@ class RadixTree {
   std::size_t insert(const std::vector<TokenId>& tokens,
                      const std::vector<BlockId>& blocks);
 
+  // Frees up to `num_blocks` blocks by dropping least-recently-used unpinned
+  // leaves. Returns how many blocks actually made it back to the free list.
+  std::size_t evict(std::size_t num_blocks);
+
+  // Pin/unpin `node` and every ancestor, so a sequence reading a cached prefix
+  // cannot have it evicted out from under it mid-flight.
+  void lock(Node* node);
+  void unlock(Node* node);
+
   std::size_t stored_blocks() const { return stored_blocks_; }
   std::size_t num_nodes() const { return num_nodes_; }
   const Node* root() const { return root_.get(); }
 
  private:
   Node* split_node(Node* node, std::size_t offset);
+  Node* find_lru_leaf();
+  void touch(Node* node) { node->last_access = ++clock_; }
   void release_blocks(Node* node);
 
   BlockPool& pool_;
   std::size_t block_tokens_;
   std::unique_ptr<Node> root_;
+  std::uint64_t clock_ = 0;
   std::size_t stored_blocks_ = 0;
   std::size_t num_nodes_ = 0;
 };

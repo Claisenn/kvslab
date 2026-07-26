@@ -150,4 +150,46 @@ TEST(radix_tree_does_not_cache_a_partial_trailing_block) {
   CHECK_EQ(pool.num_used(), std::size_t{2});
 }
 
+TEST(radix_tree_evicts_the_least_recently_used_prefix) {
+  BlockPool pool(tiny_config(8));
+  RadixTree tree(pool, 4);
+
+  // Four distinct 2-block sequences exactly fill the pool.
+  for (TokenId base = 0; base < 4; ++base) {
+    publish(tree, pool, iota_tokens(base * 1000 + 1, 8));
+  }
+  CHECK_EQ(pool.num_free(), std::size_t{0});
+
+  const std::vector<TokenId> hot = iota_tokens(1, 8);
+  tree.match_prefix(hot);  // moves `hot` to the front of the LRU order
+
+  CHECK_EQ(tree.evict(2), std::size_t{2});
+  CHECK_EQ(pool.num_free(), std::size_t{2});
+  // The recently used sequence must not be what got dropped.
+  CHECK_EQ(tree.match_prefix(hot).num_tokens, std::size_t{8});
+}
+
+TEST(radix_tree_pin_protects_a_prefix_from_eviction) {
+  BlockPool pool(tiny_config(4));
+  RadixTree tree(pool, 4);
+  publish(tree, pool, iota_tokens(1, 8));     // 2 blocks
+  publish(tree, pool, iota_tokens(1000, 8));  // 2 blocks -> pool full
+  CHECK_EQ(pool.num_free(), std::size_t{0});
+
+  // Hold the first prefix the way an in-flight request would.
+  auto held = tree.match_prefix(iota_tokens(1, 8));
+  tree.lock(held.node);
+
+  // Asked for 4 blocks, but only the unpinned sequence may be dropped.
+  CHECK_EQ(tree.evict(4), std::size_t{2});
+  CHECK_EQ(pool.num_free(), std::size_t{2});
+  CHECK_EQ(tree.match_prefix(iota_tokens(1, 8)).num_tokens, std::size_t{8});
+
+  // Once the holder is done, the same prefix becomes reclaimable.
+  tree.unlock(held.node);
+  CHECK_EQ(tree.evict(2), std::size_t{2});
+  CHECK_EQ(pool.num_free(), std::size_t{4});
+  CHECK_EQ(tree.stored_blocks(), std::size_t{0});
+}
+
 int main() { return kvcheck::run_all(); }
