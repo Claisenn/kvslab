@@ -16,6 +16,17 @@ endif()
 # is on by default rather than only in Debug.
 option(KVSLAB_ENABLE_ASSERTS "Keep assert() live even in optimized builds" ON)
 
+# Compiler-specific spellings, kept in one place so the targets below stay
+# readable. MSVC is wired up but not exercised -- clang and GCC are what this
+# is built and tested with.
+if(MSVC)
+  set(KVSLAB_WARNINGS /W4)
+  set(KVSLAB_KEEP_ASSERTS /UNDEBUG)
+else()
+  set(KVSLAB_WARNINGS -Wall -Wextra -Wpedantic)
+  set(KVSLAB_KEEP_ASSERTS -UNDEBUG)
+endif()
+
 add_library(kvslab
   src/tier.cpp
   src/block_pool.cpp
@@ -23,9 +34,9 @@ add_library(kvslab
   src/cache_manager.cpp
 )
 target_include_directories(kvslab PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_compile_options(kvslab PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_options(kvslab PRIVATE ${KVSLAB_WARNINGS})
 if(KVSLAB_ENABLE_ASSERTS)
-  target_compile_options(kvslab PUBLIC -UNDEBUG)
+  target_compile_options(kvslab PUBLIC ${KVSLAB_KEEP_ASSERTS})
 endif()
 
 enable_testing()
@@ -33,9 +44,9 @@ enable_testing()
 add_executable(kvslab_tests tests/test_kvslab.cpp)
 target_link_libraries(kvslab_tests PRIVATE kvslab)
 target_include_directories(kvslab_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-target_compile_options(kvslab_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_options(kvslab_tests PRIVATE ${KVSLAB_WARNINGS})
 add_test(NAME kvslab_tests COMMAND kvslab_tests)
 
 add_executable(bench_prefix_cache bench/bench_prefix_cache.cpp)
 target_link_libraries(bench_prefix_cache PRIVATE kvslab)
-target_compile_options(bench_prefix_cache PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_options(bench_prefix_cache PRIVATE ${KVSLAB_WARNINGS})

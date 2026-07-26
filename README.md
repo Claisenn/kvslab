@@ -72,6 +72,11 @@ cmake --build build-release -j
 ./build-release/bench_prefix_cache
 ```
 
+Needs a C++20 compiler and CMake 3.16+, and nothing else. Built and tested with
+Apple clang on macOS/arm64. The MSVC path is wired up — `_aligned_malloc` for
+the arena, `/W4` and `/UNDEBUG` for the flags — but has never been compiled, so
+treat it as a starting point rather than a supported target.
+
 Block refcount and range checks are unconditional. Violating one is not a crash
 but silent corruption — a block handed back twice lands on the free list while
 the index still points at it — and nothing downstream can detect that, so they
