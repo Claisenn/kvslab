@@ -63,6 +63,8 @@ class CacheManager {
     std::uint64_t total_tokens = 0;    // tokens across served requests
     std::uint64_t hit_tokens = 0;      // of those, the ones cache supplied
     std::uint64_t evicted_blocks = 0;
+    std::uint64_t demoted_blocks = 0;   // moved to spill instead of dropped
+    std::uint64_t promoted_blocks = 0;  // brought back to compute on a hit
     std::uint64_t alloc_failures = 0;
     std::uint64_t abandoned = 0;  // handles destroyed without release()
 
@@ -79,7 +81,14 @@ class CacheManager {
     }
   };
 
+  // Single-tier: one owned HostTier, capacity from cfg.num_blocks. Under
+  // pressure the only relief is eviction, as before.
   explicit CacheManager(const CacheConfig& cfg);
+
+  // Tiered: specs[0] is the compute tier, specs[1] the spill tier cold
+  // entries demote into instead of being dropped. Tiers are borrowed and must
+  // outlive the manager.
+  CacheManager(const std::vector<BlockPool::TierSpec>& specs, const CacheConfig& cfg);
 
   Allocation acquire(const std::vector<TokenId>& tokens);
   void release(const std::vector<TokenId>& tokens, Allocation& alloc);

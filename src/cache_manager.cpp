@@ -59,6 +59,10 @@ void CacheManager::abandon(Allocation& alloc) {
 CacheManager::CacheManager(const CacheConfig& cfg)
     : cfg_(cfg), pool_(cfg), tree_(pool_, cfg.block_tokens) {}
 
+CacheManager::CacheManager(const std::vector<BlockPool::TierSpec>& specs,
+                           const CacheConfig& cfg)
+    : cfg_(cfg), pool_(specs, cfg), tree_(pool_, cfg.block_tokens) {}
+
 CacheManager::Allocation CacheManager::acquire(const std::vector<TokenId>& tokens) {
   ++stats_.requests;
 
@@ -83,16 +87,44 @@ CacheManager::Allocation CacheManager::acquire(const std::vector<TokenId>& token
   alloc.cached_blocks = match.blocks.size();
   alloc.blocks = std::move(match.blocks);
 
+  // Compute-tier demand: slots for the new blocks, plus one per matched block
+  // currently in a spill tier -- the kernel reads from compute memory, so a
+  // hit on a demoted prefix has to bring it back before it counts.
   const std::size_t fresh = need_blocks - alloc.cached_blocks;
-  if (pool_.num_free() < fresh) {
-    stats_.evicted_blocks += tree_.evict(fresh - pool_.num_free());
+  std::size_t promotions = 0;
+  for (BlockId id : alloc.blocks) {
+    if (pool_.block_tier(id) != 0) ++promotions;
   }
-  if (pool_.num_free() < fresh) {
+  const std::size_t demand = fresh + promotions;
+
+  if (pool_.num_free() < demand && pool_.num_tiers() > 1) {
+    // Prefer demotion: it frees the same compute slots but keeps the entries,
+    // so the cost is a future promotion instead of a recompute. The matched
+    // path is pinned and demote() skips pinned nodes, so it cannot move the
+    // very blocks this request is about to promote.
+    stats_.demoted_blocks += tree_.demote(demand - pool_.num_free(), 1);
+  }
+  while (pool_.num_free() < demand) {
+    const std::size_t evicted = tree_.evict(demand - pool_.num_free());
+    if (evicted == 0) break;
+    stats_.evicted_blocks += evicted;
+  }
+  if (pool_.num_free() < demand) {
     // Oversubscribed by in-flight sequences. Back out cleanly and let the
     // scheduler retry once something finishes; a partial allocation would leak.
     if (alloc.pinned != nullptr) tree_.unlock(alloc.pinned);
     ++stats_.alloc_failures;
     return Allocation{};
+  }
+
+  // Promote what the hit needs. Slots were counted into `demand`, so these
+  // cannot fail; the spill slots they vacate become room for future demotions.
+  for (BlockId id : alloc.blocks) {
+    if (pool_.block_tier(id) == 0) continue;
+    const bool moved = pool_.migrate(id, 0);
+    assert(moved && "promotion failed despite reserved compute slots");
+    (void)moved;
+    ++stats_.promoted_blocks;
   }
 
   alloc.blocks.reserve(need_blocks);

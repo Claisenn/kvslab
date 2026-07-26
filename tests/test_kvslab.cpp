@@ -580,6 +580,61 @@ TEST(cache_manager_moved_handle_releases_exactly_once) {
   CHECK_EQ(cm.pool().num_used(), reachable_blocks(cm.tree()));
 }
 
+TEST(cache_manager_demotes_under_pressure_and_promotes_on_the_hit) {
+  const CacheConfig cfg = tiny_config(0);
+  HostTier compute(4 * cfg.block_bytes());
+  HostTier spill(8 * cfg.block_bytes());
+  CacheManager cm({{&compute, 4}, {&spill, 8}}, cfg);
+
+  const std::vector<TokenId> a = iota_tokens(1, 8);     // 2 blocks
+  const std::vector<TokenId> b = iota_tokens(1000, 8);  // 2 blocks
+  run_once(cm, a);
+  run_once(cm, b);  // compute tier now full
+
+  // A third sequence forces room. With a spill tier, the LRU entry is demoted
+  // rather than dropped: nothing is evicted, and the index keeps all three.
+  run_once(cm, iota_tokens(2000, 8));
+  CHECK_EQ(cm.stats().demoted_blocks, std::uint64_t{2});
+  CHECK_EQ(cm.stats().evicted_blocks, std::uint64_t{0});
+  CHECK_EQ(cm.tree().stored_blocks(), std::size_t{6});
+
+  // Re-acquiring the demoted sequence is a full hit -- the entry survived --
+  // and its blocks come back to the compute tier before the table is returned,
+  // demoting someone else to make room.
+  auto hit = cm.acquire(a);
+  CHECK(hit.ok);
+  CHECK_EQ(hit.cached_tokens, std::size_t{8});
+  CHECK_EQ(cm.stats().promoted_blocks, std::uint64_t{2});
+  for (BlockId id : hit.blocks) {
+    CHECK_EQ(cm.pool().block_tier(id), BlockPool::TierIndex{0});
+  }
+  cm.release(a, hit);
+
+  // Nothing was recomputed to get here: every request after the first three
+  // was served from the index, just not always from the compute tier.
+  CHECK_EQ(cm.pool().num_used(), reachable_blocks(cm.tree()));
+}
+
+TEST(cache_manager_falls_back_to_eviction_when_spill_is_full) {
+  const CacheConfig cfg = tiny_config(0);
+  HostTier compute(2 * cfg.block_bytes());
+  HostTier spill(2 * cfg.block_bytes());
+  CacheManager cm({{&compute, 2}, {&spill, 2}}, cfg);
+
+  // Two sequences fill compute; the third demotes the first into spill, which
+  // is then also full.
+  run_once(cm, iota_tokens(1, 8));
+  run_once(cm, iota_tokens(1000, 8));
+  run_once(cm, iota_tokens(2000, 8));
+  CHECK_EQ(cm.stats().demoted_blocks, std::uint64_t{2});
+
+  // A fourth sequence finds no spill room: demotion cannot help, so the LRU
+  // entry is evicted outright -- the single-tier behaviour, as the last resort.
+  run_once(cm, iota_tokens(3000, 8));
+  CHECK(cm.stats().evicted_blocks >= 2);
+  CHECK_EQ(cm.pool().num_used(), reachable_blocks(cm.tree()));
+}
+
 TEST(cache_manager_leaks_no_blocks_across_a_mixed_workload) {
   CacheManager cm(tiny_config(32));
   const std::vector<TokenId> prompt = iota_tokens(1, 12);
