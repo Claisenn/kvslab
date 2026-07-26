@@ -19,6 +19,7 @@ option(KVSLAB_ENABLE_ASSERTS "Keep assert() live even in optimized builds" ON)
 add_library(kvslab
   src/block_pool.cpp
   src/radix_tree.cpp
+  src/cache_manager.cpp
 )
 target_include_directories(kvslab PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(kvslab PRIVATE -Wall -Wextra -Wpedantic)

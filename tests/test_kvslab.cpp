@@ -3,6 +3,7 @@
 
 #include "check.hpp"
 #include "kvslab/block_pool.hpp"
+#include "kvslab/cache_manager.hpp"
 #include "kvslab/radix_tree.hpp"
 
 using namespace kvslab;
@@ -45,6 +46,13 @@ std::vector<BlockId> publish(RadixTree& tree, BlockPool& pool,
   tree.insert(tokens, ids);
   for (BlockId id : ids) pool.decref(id);
   return ids;
+}
+
+// One full request lifecycle through the manager.
+void run_once(CacheManager& cm, const std::vector<TokenId>& tokens) {
+  auto alloc = cm.acquire(tokens);
+  CHECK(alloc.ok);
+  cm.release(tokens, alloc);
 }
 
 }  // namespace
@@ -190,6 +198,104 @@ TEST(radix_tree_pin_protects_a_prefix_from_eviction) {
   CHECK_EQ(tree.evict(2), std::size_t{2});
   CHECK_EQ(pool.num_free(), std::size_t{4});
   CHECK_EQ(tree.stored_blocks(), std::size_t{0});
+}
+
+TEST(cache_manager_reuses_an_identical_sequence) {
+  CacheManager cm(tiny_config(64));
+  const std::vector<TokenId> seq = iota_tokens(1, 16);
+
+  auto first = cm.acquire(seq);
+  CHECK(first.ok);
+  CHECK_EQ(first.cached_tokens, std::size_t{0});
+  CHECK_EQ(first.blocks.size(), std::size_t{4});
+  const std::vector<BlockId> original = first.blocks;
+  cm.release(seq, first);
+
+  auto second = cm.acquire(seq);
+  CHECK(second.ok);
+  CHECK_EQ(second.cached_tokens, std::size_t{16});
+  CHECK(second.blocks == original);
+  cm.release(seq, second);
+
+  // Only the cached copy should still be resident.
+  CHECK_EQ(cm.pool().num_used(), std::size_t{4});
+  CHECK_EQ(cm.tree().stored_blocks(), std::size_t{4});
+}
+
+TEST(cache_manager_reuses_a_shared_prefix) {
+  CacheManager cm(tiny_config(64));
+  run_once(cm, iota_tokens(1, 16));
+
+  const std::vector<TokenId> forked = concat(iota_tokens(1, 8), {900, 901, 902, 903});
+  auto alloc = cm.acquire(forked);
+  CHECK(alloc.ok);
+  CHECK_EQ(alloc.cached_tokens, std::size_t{8});
+  CHECK_EQ(alloc.cached_blocks, std::size_t{2});
+  CHECK_EQ(alloc.blocks.size(), std::size_t{3});
+  cm.release(forked, alloc);
+}
+
+TEST(cache_manager_does_not_publish_a_partial_trailing_block) {
+  CacheManager cm(tiny_config(64));
+  const std::vector<TokenId> seq = iota_tokens(1, 10);
+  auto alloc = cm.acquire(seq);
+  CHECK(alloc.ok);
+  CHECK_EQ(alloc.blocks.size(), std::size_t{3});
+  cm.release(seq, alloc);
+
+  // The partial block is handed back rather than published to the index.
+  CHECK_EQ(cm.tree().stored_blocks(), std::size_t{2});
+  CHECK_EQ(cm.pool().num_used(), std::size_t{2});
+}
+
+TEST(cache_manager_evicts_under_pressure) {
+  CacheManager cm(tiny_config(8));
+  for (TokenId base = 0; base < 4; ++base) {
+    run_once(cm, iota_tokens(base * 1000 + 1, 8));  // 2 blocks each -> pool full
+  }
+  CHECK_EQ(cm.pool().num_free(), std::size_t{0});
+
+  const std::vector<TokenId> fresh = iota_tokens(50'000, 8);
+  auto alloc = cm.acquire(fresh);
+  CHECK(alloc.ok);
+  CHECK_EQ(alloc.cached_tokens, std::size_t{0});
+  CHECK(cm.stats().evicted_blocks >= 2);
+  cm.release(fresh, alloc);
+}
+
+TEST(cache_manager_refuses_when_every_candidate_is_pinned) {
+  CacheManager cm(tiny_config(4));
+  const std::vector<TokenId> hot = iota_tokens(1, 8);
+  run_once(cm, hot);
+
+  auto held = cm.acquire(hot);
+  CHECK(held.ok);
+  CHECK_EQ(held.cached_tokens, std::size_t{8});
+
+  // Needs 3 blocks with 2 free, and the only eviction candidate is pinned.
+  const std::vector<TokenId> big = iota_tokens(5000, 12);
+  auto blocked = cm.acquire(big);
+  CHECK(!blocked.ok);
+  CHECK_EQ(cm.stats().alloc_failures, std::uint64_t{1});
+  // Failing must not have handed out the pinned blocks or leaked new ones.
+  CHECK_EQ(cm.pool().refcount(held.blocks[0]), std::uint32_t{1});
+
+  // Once the holder finishes, the same request goes through.
+  cm.release(hot, held);
+  auto retried = cm.acquire(big);
+  CHECK(retried.ok);
+  cm.release(big, retried);
+}
+
+TEST(cache_manager_leaks_no_blocks_across_a_mixed_workload) {
+  CacheManager cm(tiny_config(32));
+  const std::vector<TokenId> prompt = iota_tokens(1, 12);
+  for (TokenId turn = 0; turn < 20; ++turn) {
+    run_once(cm, concat(prompt, iota_tokens(turn * 100 + 500, 9)));
+  }
+  // Every block still allocated must be one the index owns; anything else is a
+  // sequence that failed to give its blocks back.
+  CHECK_EQ(cm.pool().num_used(), cm.tree().stored_blocks());
 }
 
 int main() { return kvcheck::run_all(); }
