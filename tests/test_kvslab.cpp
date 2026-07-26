@@ -257,6 +257,30 @@ TEST(radix_tree_does_not_cache_a_partial_trailing_block) {
   CHECK_EQ(pool.num_used(), std::size_t{2});
 }
 
+TEST(radix_tree_tears_down_a_deep_chain) {
+  // Each turn extends the previous sequence by exactly one block, so the index
+  // becomes a single chain rather than a bush -- the shape a long multi-turn
+  // conversation produces, and the one that makes recursive teardown a risk.
+  constexpr std::size_t kDepth = 1000;
+  BlockPool pool(tiny_config(2 * kDepth + 8));
+  RadixTree tree(pool, 4);
+
+  std::vector<TokenId> seq;
+  for (std::size_t turn = 0; turn < kDepth; ++turn) {
+    const std::vector<TokenId> next = iota_tokens(static_cast<TokenId>(turn) * 4 + 1, 4);
+    seq.insert(seq.end(), next.begin(), next.end());
+    publish(tree, pool, seq);
+  }
+
+  // One node and one block per turn: no splits, since every sequence is a
+  // strict extension of the one before it.
+  CHECK_EQ(tree.num_nodes(), kDepth);
+  CHECK_EQ(reachable_blocks(tree), kDepth);
+  CHECK_EQ(pool.num_used(), kDepth);
+  // The tree is destroyed at scope exit. A recursive teardown would go kDepth
+  // frames deep here, and real conversations reach far past this.
+}
+
 TEST(radix_tree_evicts_the_least_recently_used_prefix) {
   BlockPool pool(tiny_config(8));
   RadixTree tree(pool, 4);

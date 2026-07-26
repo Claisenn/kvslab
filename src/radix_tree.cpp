@@ -14,14 +14,26 @@ RadixTree::RadixTree(BlockPool& pool, std::size_t block_tokens)
 }
 
 RadixTree::~RadixTree() {
-  // Hand every cached block back before the nodes go away, otherwise the pool
-  // outlives the tree holding references to blocks nobody can reach.
-  std::vector<Node*> stack{root_.get()};
-  while (!stack.empty()) {
-    Node* node = stack.back();
-    stack.pop_back();
-    release_blocks(node);
-    for (auto& [key, child] : node->children) stack.push_back(child.get());
+  // Two things have to happen here. Every cached block goes back to the pool,
+  // or the pool outlives the tree still holding references to blocks nobody can
+  // reach. And the nodes come apart iteratively: letting the unique_ptr chain
+  // unwind on its own recurses once per level, and the tree is a chain, not a
+  // bush, whenever a conversation keeps extending the same prefix -- exactly
+  // the shape a long multi-turn session produces.
+  std::vector<std::unique_ptr<Node>> pending;
+  pending.push_back(std::move(root_));
+
+  while (!pending.empty()) {
+    std::unique_ptr<Node> node = std::move(pending.back());
+    pending.pop_back();
+    if (node == nullptr) continue;
+
+    release_blocks(node.get());
+    for (auto& [key, child] : node->children) {
+      if (child != nullptr) pending.push_back(std::move(child));
+    }
+    node->children.clear();
+    // `node` dies here with no children left to recurse into.
   }
 }
 
