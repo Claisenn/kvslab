@@ -1,10 +1,13 @@
+#include <cstring>
 #include <numeric>
+#include <stdexcept>
 #include <vector>
 
 #include "check.hpp"
 #include "kvslab/block_pool.hpp"
 #include "kvslab/cache_manager.hpp"
 #include "kvslab/radix_tree.hpp"
+#include "kvslab/tier.hpp"
 
 using namespace kvslab;
 
@@ -56,6 +59,51 @@ void run_once(CacheManager& cm, const std::vector<TokenId>& tokens) {
 }
 
 }  // namespace
+
+TEST(host_tier_round_trips_bytes) {
+  HostTier tier(4000);
+  // Capacity is rounded up to a page so the arena can be pinned or registered
+  // whole; the tier reports what it actually owns rather than what was asked for.
+  CHECK_EQ(tier.capacity_bytes(), std::size_t{4096});
+  CHECK(tier.host_data() != nullptr);
+
+  const std::uint64_t written = 0xfeedfacecafebeefull;
+  tier.write(128, &written, sizeof(written));
+  std::uint64_t read = 0;
+  tier.read(128, &read, sizeof(read));
+  CHECK_EQ(read, written);
+}
+
+TEST(block_pool_lays_blocks_out_on_a_borrowed_tier) {
+  const CacheConfig cfg = tiny_config(4);
+  HostTier tier(cfg.total_bytes());
+  BlockPool pool(tier, cfg);
+
+  const BlockId a = pool.allocate();
+  const BlockId b = pool.allocate();
+  CHECK_EQ(pool.block_offset(a), static_cast<std::size_t>(a) * cfg.block_bytes());
+  CHECK(pool.block_data(a) == static_cast<void*>(tier.host_data() + pool.block_offset(a)));
+
+  // Blocks must not overlap: filling one leaves its neighbour untouched.
+  std::memset(pool.block_data(a), 0xAB, cfg.block_bytes());
+  std::memset(pool.block_data(b), 0x00, cfg.block_bytes());
+  const auto* bytes_a = static_cast<const unsigned char*>(pool.block_data(a));
+  CHECK_EQ(bytes_a[cfg.block_bytes() - 1], static_cast<unsigned char>(0xAB));
+}
+
+TEST(block_pool_rejects_a_tier_that_cannot_hold_it) {
+  const CacheConfig cfg = tiny_config(64);
+  HostTier tier(cfg.total_bytes() / 2);  // half the room the pool needs
+
+  bool threw = false;
+  try {
+    BlockPool pool(tier, cfg);
+    (void)pool;
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  CHECK(threw);
+}
 
 TEST(block_pool_allocates_and_recycles) {
   BlockPool pool(tiny_config(4));

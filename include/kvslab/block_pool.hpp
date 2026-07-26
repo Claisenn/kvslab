@@ -1,27 +1,33 @@
 #pragma once
 
 #include <cstddef>
+#include <memory>
 #include <vector>
 
+#include "kvslab/tier.hpp"
 #include "kvslab/types.hpp"
 
 namespace kvslab {
 
-// Fixed-size block allocator over one contiguous, page-aligned arena.
+// Fixed-size block allocator carving a tier into equal blocks.
 //
-// This is the storage substrate everything else sits on. A production stack
-// backs the arena with device memory (cudaMalloc, or the VMM APIs when it wants
-// to grow the pool without reserving it up front); here it is plain host memory
-// so the whole engine builds and runs on a laptop with no GPU. Replacing the
-// arena with a device allocation is the `Tier` abstraction on the roadmap.
+// The pool owns the *bookkeeping* -- which blocks are free, who holds a
+// reference -- and nothing about the storage itself. Where the bytes live is
+// the tier's problem, which is what lets the same allocator sit on host memory
+// today and on device memory or NVMe later without changing a line here.
 //
 // Not thread safe. Serving engines drive block allocation from a single
 // scheduler thread; making this lock-free is a later exercise, not free
 // complexity to take on now.
 class BlockPool {
  public:
+  // Allocates and owns a HostTier sized for `cfg`. The single-tier case should
+  // not have to assemble the tier by hand.
   explicit BlockPool(const CacheConfig& cfg);
-  ~BlockPool();
+
+  // Borrows an externally-owned tier, which must outlive the pool and must be
+  // at least `cfg.total_bytes()` large.
+  BlockPool(Tier& tier, const CacheConfig& cfg);
 
   BlockPool(const BlockPool&) = delete;
   BlockPool& operator=(const BlockPool&) = delete;
@@ -34,8 +40,18 @@ class BlockPool {
   bool decref(BlockId id);
   std::uint32_t refcount(BlockId id) const;
 
+  // Byte offset of the block within the tier. Valid on every tier, and the
+  // only addressing a device-backed tier can offer.
+  std::size_t block_offset(BlockId id) const;
+
+  // Direct pointer to the block's bytes, or nullptr when the tier is not
+  // host-addressable. Prefer block_offset() + tier().read/write in code that
+  // must work on any tier.
   void* block_data(BlockId id);
   const void* block_data(BlockId id) const;
+
+  Tier& tier() { return tier_; }
+  const Tier& tier() const { return tier_; }
 
   std::size_t num_free() const { return free_list_.size(); }
   std::size_t num_blocks() const { return cfg_.num_blocks; }
@@ -43,9 +59,11 @@ class BlockPool {
   const CacheConfig& config() const { return cfg_; }
 
  private:
+  void init();
+
   CacheConfig cfg_;
-  std::byte* arena_ = nullptr;
-  std::size_t arena_bytes_ = 0;
+  std::unique_ptr<HostTier> owned_tier_;  // non-null only for the owning ctor
+  Tier& tier_;
   std::vector<BlockId> free_list_;
   std::vector<std::uint32_t> refcount_;
 };

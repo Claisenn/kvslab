@@ -17,6 +17,7 @@ endif()
 option(KVSLAB_ENABLE_ASSERTS "Keep assert() live even in optimized builds" ON)
 
 add_library(kvslab
+  src/tier.cpp
   src/block_pool.cpp
   src/radix_tree.cpp
   src/cache_manager.cpp

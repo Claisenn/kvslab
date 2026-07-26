@@ -1,28 +1,24 @@
 #include "kvslab/block_pool.hpp"
 
 #include <cassert>
-#include <cstdlib>
-#include <new>
+#include <stdexcept>
 
 namespace kvslab {
-namespace {
 
-// Page-granular so the arena can later be pinned, registered with an RDMA NIC,
-// or handed to cudaHostRegister without straddling page boundaries.
-constexpr std::size_t kArenaAlignment = 4096;
-
-std::size_t round_up(std::size_t value, std::size_t multiple) {
-  return ((value + multiple - 1) / multiple) * multiple;
+BlockPool::BlockPool(const CacheConfig& cfg)
+    : cfg_(cfg),
+      owned_tier_(std::make_unique<HostTier>(cfg.total_bytes())),
+      tier_(*owned_tier_) {
+  init();
 }
 
-}  // namespace
+BlockPool::BlockPool(Tier& tier, const CacheConfig& cfg) : cfg_(cfg), tier_(tier) {
+  init();
+}
 
-BlockPool::BlockPool(const CacheConfig& cfg) : cfg_(cfg) {
-  arena_bytes_ = round_up(cfg_.total_bytes(), kArenaAlignment);
-  if (arena_bytes_ > 0) {
-    void* raw = std::aligned_alloc(kArenaAlignment, arena_bytes_);
-    if (raw == nullptr) throw std::bad_alloc();
-    arena_ = static_cast<std::byte*>(raw);
+void BlockPool::init() {
+  if (tier_.capacity_bytes() < cfg_.total_bytes()) {
+    throw std::invalid_argument("kvslab: tier is too small for the requested pool");
   }
 
   refcount_.assign(cfg_.num_blocks, 0);
@@ -33,8 +29,6 @@ BlockPool::BlockPool(const CacheConfig& cfg) : cfg_(cfg) {
     free_list_.push_back(static_cast<BlockId>(i - 1));
   }
 }
-
-BlockPool::~BlockPool() { std::free(arena_); }
 
 BlockId BlockPool::allocate() {
   if (free_list_.empty()) return kInvalidBlock;
@@ -66,14 +60,23 @@ std::uint32_t BlockPool::refcount(BlockId id) const {
   return refcount_[id];
 }
 
-void* BlockPool::block_data(BlockId id) {
+std::size_t BlockPool::block_offset(BlockId id) const {
   assert(id < cfg_.num_blocks);
-  return arena_ + static_cast<std::size_t>(id) * cfg_.block_bytes();
+  return static_cast<std::size_t>(id) * cfg_.block_bytes();
+}
+
+void* BlockPool::block_data(BlockId id) {
+  std::byte* base = tier_.host_data();
+  if (base == nullptr) return nullptr;  // device tier: use block_offset() instead
+  return base + block_offset(id);
 }
 
 const void* BlockPool::block_data(BlockId id) const {
-  assert(id < cfg_.num_blocks);
-  return arena_ + static_cast<std::size_t>(id) * cfg_.block_bytes();
+  // host_data() is non-const because a device tier may have to map on demand;
+  // reading through it here does not mutate the pool's own state.
+  std::byte* base = const_cast<Tier&>(tier_).host_data();
+  if (base == nullptr) return nullptr;
+  return base + block_offset(id);
 }
 
 }  // namespace kvslab
