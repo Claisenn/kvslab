@@ -104,6 +104,10 @@ class CacheManager {
     // Off means a hit on a spilled prefix pays its copies before returning,
     // and every allocation is born ready.
     bool async_promotion = false;
+    // Store spilled blocks through this codec (e.g. fp16 -> fp8), so the same
+    // spill arena holds more entries at an accuracy cost instead of dropping
+    // them. Borrowed; must outlive the manager. Null means spill verbatim.
+    const SpillCodec* spill_codec = nullptr;
   };
 
   // Tiered: specs[0] is the compute tier, specs[1] the spill tier cold

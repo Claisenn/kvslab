@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <numeric>
 #include <stdexcept>
@@ -6,6 +7,7 @@
 
 #include "check.hpp"
 #include "kvslab/block_pool.hpp"
+#include "kvslab/codec.hpp"
 #include "kvslab/cache_manager.hpp"
 #include "kvslab/radix_tree.hpp"
 #include "kvslab/tier.hpp"
@@ -828,6 +830,213 @@ TEST(cache_manager_leaks_no_blocks_across_a_mixed_workload) {
   // No entry should have been refused: a collision here would mean the 64-bit
   // block key is doing far worse than chance on a 20-sequence workload.
   CHECK_EQ(cm.tree().hash_collisions(), std::size_t{0});
+}
+
+// ---------------------------------------------------------------------------
+// Spill codec: fp16 -> fp8 E4M3 on the demotion path.
+
+namespace {
+
+// One shared instance: building the 64 KiB encode table once per test binary,
+// not once per test.
+const Fp8SpillCodec& fp8_codec() {
+  static Fp8SpillCodec codec;
+  return codec;
+}
+
+// |a - b| within E4M3 round-to-nearest error: half a mantissa step (2^-4
+// relative) for normals, half a subnormal step (2^-10 absolute) near zero.
+bool close_e4m3(float exact, float quantized) {
+  const float err = std::fabs(exact - quantized);
+  return err <= std::fabs(exact) / 16.0f + 0x1.0p-10f;
+}
+
+// Deterministic fp16 test values spanning the E4M3 range, indexable so a
+// block's worth can be regenerated for comparison after a round trip.
+std::uint16_t fp16_sample(std::size_t i) {
+  // All within E4M3's finite range: saturation is exercised by the scalar
+  // test, and would break the round-trip tolerance this helper feeds.
+  const float magnitudes[] = {0.0f,    0x1.0p-9f, 0.0173f, 0.25f,  1.0f,
+                              3.1416f, 17.5f,     100.0f,  240.0f, 447.0f};
+  const std::size_t n = sizeof(magnitudes) / sizeof(magnitudes[0]);
+  const float sign = (i / n) % 2 == 0 ? 1.0f : -1.0f;
+  return float_to_fp16_bits(sign * magnitudes[i % n]);
+}
+
+}  // namespace
+
+TEST(fp8_scalar_conversions_round_to_nearest_and_saturate) {
+  // Exactly representable values survive untouched.
+  CHECK_EQ(e4m3_to_float(float_to_e4m3(1.0f)), 1.0f);
+  CHECK_EQ(e4m3_to_float(float_to_e4m3(-2.5f)), -2.5f);
+  CHECK_EQ(e4m3_to_float(float_to_e4m3(448.0f)), 448.0f);
+  CHECK_EQ(e4m3_to_float(float_to_e4m3(0x1.0p-9f)), 0x1.0p-9f);  // min subnormal
+  CHECK_EQ(e4m3_to_float(float_to_e4m3(0.0f)), 0.0f);
+
+  // Out of range saturates to max finite rather than producing NaN.
+  CHECK_EQ(e4m3_to_float(float_to_e4m3(10000.0f)), 448.0f);
+  CHECK_EQ(e4m3_to_float(float_to_e4m3(-10000.0f)), -448.0f);
+
+  // Everything in range lands within half a quantization step.
+  for (float v : {0.017f, 0.3f, 1.7f, 7.3f, 42.0f, 200.0f, 447.0f}) {
+    CHECK(close_e4m3(v, e4m3_to_float(float_to_e4m3(v))));
+    CHECK(close_e4m3(-v, e4m3_to_float(float_to_e4m3(-v))));
+  }
+}
+
+TEST(fp8_codec_roundtrip_is_within_tolerance_and_in_place_safe) {
+  const std::size_t values = 4096;
+  std::vector<std::byte> raw(values * 2);
+  for (std::size_t i = 0; i < values; ++i) {
+    const std::uint16_t h = fp16_sample(i);
+    std::memcpy(raw.data() + 2 * i, &h, 2);
+  }
+
+  // Out-of-place round trip.
+  std::vector<std::byte> enc(values);
+  std::vector<std::byte> back(values * 2);
+  fp8_codec().encode(raw.data(), raw.size(), enc.data());
+  fp8_codec().decode(enc.data(), raw.size(), back.data());
+  for (std::size_t i = 0; i < values; ++i) {
+    std::uint16_t orig, got;
+    std::memcpy(&orig, raw.data() + 2 * i, 2);
+    std::memcpy(&got, back.data() + 2 * i, 2);
+    CHECK(close_e4m3(fp16_bits_to_float(orig), fp16_bits_to_float(got)));
+  }
+
+  // In-place over one buffer -- the bounce path's contract -- must agree
+  // byte for byte with the out-of-place result.
+  std::vector<std::byte> scratch = raw;
+  fp8_codec().encode(scratch.data(), raw.size(), scratch.data());
+  CHECK(std::memcmp(scratch.data(), enc.data(), values) == 0);
+  fp8_codec().decode(scratch.data(), raw.size(), scratch.data());
+  CHECK(std::memcmp(scratch.data(), back.data(), values * 2) == 0);
+}
+
+TEST(tiered_pool_with_codec_migrates_through_half_size_spill_slots) {
+  CacheConfig cfg;
+  cfg.block_tokens = 4;
+  cfg.num_layers = 2;
+  cfg.num_kv_heads = 2;
+  cfg.head_dim = 8;
+
+  // The spill arena is sized for 4 *encoded* blocks -- half the bytes the
+  // same four blocks need raw. Construction succeeding is itself the
+  // capacity claim: without the codec this spec must be rejected.
+  HostTier compute(2 * cfg.block_bytes());
+  HostTier spill(4 * (cfg.block_bytes() / 2));
+  BlockPool pool({{&compute, 2}, {&spill, 4}}, cfg, &fp8_codec());
+  CHECK_EQ(pool.tier_block_bytes(0), cfg.block_bytes());
+  CHECK_EQ(pool.tier_block_bytes(1), cfg.block_bytes() / 2);
+
+  const BlockId id = pool.allocate();
+  CHECK(id != kInvalidBlock);
+  const std::size_t values = cfg.block_bytes() / 2;
+  auto* data = static_cast<std::byte*>(pool.block_data(id));
+  for (std::size_t i = 0; i < values; ++i) {
+    const std::uint16_t h = fp16_sample(i);
+    std::memcpy(data + 2 * i, &h, 2);
+  }
+
+  // Demote (encodes) and promote (decodes): values come back within fp8
+  // tolerance, not byte-identical -- that is the trade the codec makes.
+  CHECK(pool.migrate(id, 1));
+  CHECK_EQ(pool.block_tier(id), 1u);
+  CHECK(pool.migrate(id, 0));
+  CHECK_EQ(pool.block_tier(id), 0u);
+  data = static_cast<std::byte*>(pool.block_data(id));
+  for (std::size_t i = 0; i < values; ++i) {
+    std::uint16_t got;
+    std::memcpy(&got, data + 2 * i, 2);
+    CHECK(close_e4m3(fp16_bits_to_float(fp16_sample(i)), fp16_bits_to_float(got)));
+  }
+
+  // A second round trip changes nothing more: E4M3 values re-encode to
+  // themselves, so quantization error is paid once, not per demotion.
+  std::vector<std::byte> after_first(cfg.block_bytes());
+  std::memcpy(after_first.data(), data, cfg.block_bytes());
+  CHECK(pool.migrate(id, 1));
+  CHECK(pool.migrate(id, 0));
+  CHECK(std::memcmp(pool.block_data(id), after_first.data(), cfg.block_bytes()) == 0);
+
+  pool.decref(id);
+}
+
+TEST(async_migration_with_codec_encodes_on_the_worker) {
+  CacheConfig cfg;
+  cfg.block_tokens = 4;
+  cfg.num_layers = 2;
+  cfg.num_kv_heads = 2;
+  cfg.head_dim = 8;
+
+  HostTier compute(2 * cfg.block_bytes());
+  HostTier spill(2 * (cfg.block_bytes() / 2));
+  BlockPool pool({{&compute, 2}, {&spill, 2}}, cfg, &fp8_codec());
+
+  const BlockId id = pool.allocate();
+  const std::size_t values = cfg.block_bytes() / 2;
+  auto* data = static_cast<std::byte*>(pool.block_data(id));
+  for (std::size_t i = 0; i < values; ++i) {
+    const std::uint16_t h = fp16_sample(i);
+    std::memcpy(data + 2 * i, &h, 2);
+  }
+
+  CHECK(pool.migrate_async(id, 1));
+  pool.wait_for_migrations();
+  CHECK_EQ(pool.block_tier(id), 1u);
+  CHECK(pool.migrate_async(id, 0));
+  pool.wait_for_migrations();
+  CHECK_EQ(pool.block_tier(id), 0u);
+
+  data = static_cast<std::byte*>(pool.block_data(id));
+  for (std::size_t i = 0; i < values; ++i) {
+    std::uint16_t got;
+    std::memcpy(&got, data + 2 * i, 2);
+    CHECK(close_e4m3(fp16_bits_to_float(fp16_sample(i)), fp16_bits_to_float(got)));
+  }
+  pool.decref(id);
+}
+
+TEST(cache_manager_with_codec_serves_hits_from_a_doubled_spill_tier) {
+  CacheConfig cfg;
+  cfg.block_tokens = 4;
+  cfg.num_layers = 2;
+  cfg.num_kv_heads = 2;
+  cfg.head_dim = 8;
+
+  // Compute holds 2 sequences; the spill arena has raw room for 2 blocks but
+  // encoded room for 4. Four single-block sequences then all stay resident:
+  // without the codec the same bytes would force half of them out.
+  HostTier compute(2 * cfg.block_bytes());
+  HostTier spill(4 * (cfg.block_bytes() / 2));
+  CacheManager cm({{&compute, 2}, {&spill, 4}}, cfg,
+                  {.spill_codec = &fp8_codec()});
+
+  auto seq = [&](TokenId base) {
+    std::vector<TokenId> tokens(cfg.block_tokens);
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
+      tokens[i] = base + static_cast<TokenId>(i);
+    }
+    return tokens;
+  };
+
+  for (TokenId base : {100, 200, 300, 400}) {
+    auto tokens = seq(base);
+    auto alloc = cm.acquire(tokens);
+    CHECK(alloc.ok);
+    cm.release(tokens, alloc);
+  }
+
+  // Re-visit all four: every one must be a full hit -- served from compute
+  // or promoted back out of the encoded spill tier, never recomputed.
+  for (TokenId base : {100, 200, 300, 400}) {
+    auto tokens = seq(base);
+    auto alloc = cm.acquire(tokens);
+    CHECK(alloc.ok);
+    CHECK_EQ(alloc.cached_tokens, tokens.size());
+    cm.release(tokens, alloc);
+  }
+  CHECK_EQ(cm.stats().evicted_blocks, std::uint64_t{0});
 }
 
 int main() { return kvcheck::run_all(); }

@@ -62,7 +62,7 @@ CacheManager::CacheManager(const CacheConfig& cfg)
 CacheManager::CacheManager(const std::vector<BlockPool::TierSpec>& specs,
                            const CacheConfig& cfg, Options options)
     : cfg_(cfg),
-      pool_(specs, cfg),
+      pool_(specs, cfg, options.spill_codec),
       tree_(pool_, cfg.block_tokens),
       options_(options) {}
 

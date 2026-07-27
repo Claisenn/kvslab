@@ -29,6 +29,7 @@ endif()
 
 add_library(kvslab
   src/tier.cpp
+  src/codec.cpp
   src/block_pool.cpp
   src/radix_tree.cpp
   src/cache_manager.cpp

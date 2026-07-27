@@ -233,6 +233,34 @@ void bench_tiering(const CacheConfig& cfg) {
     print_tier_row("  + async promote x8", run_pipelined(cm, workload, 8));
   }
 
+  // Same experiment with the spill arena capped below what the overflow
+  // needs raw. Under round-robin LRU any capacity deficit decays to a total
+  // miss -- the entry evicted is always the next one asked for -- so the two
+  // rows land on opposite sides of a cliff: fp16 in this arena leaves the
+  // cache 256 blocks short, fp8 fits the whole working set with room for the
+  // demote-before-promote shuffle to breathe. Same bytes, twice the blocks.
+  const std::size_t tight_raw_blocks = 768;
+  const std::size_t tight_bytes = tight_raw_blocks * cfg.block_bytes();
+  std::printf("\nspill arena capped at %.2f GiB (fp8 codec doubles what it holds)\n",
+              static_cast<double>(tight_bytes) / (1024.0 * 1024.0 * 1024.0));
+  std::printf("%-22s %10s %11s %11s %9s %9s\n", "configuration", "req/s", "hit rate",
+              "evicted", "demoted", "promoted");
+  std::printf("%s\n", std::string(78, '-').c_str());
+  {
+    HostTier compute(compute_blocks * cfg.block_bytes());
+    HostTier spill(tight_bytes);
+    CacheManager cm({{&compute, compute_blocks}, {&spill, tight_raw_blocks}}, cfg);
+    print_tier_row("spill fp16", run_manager(cm, workload));
+  }
+  {
+    Fp8SpillCodec codec;
+    HostTier compute(compute_blocks * cfg.block_bytes());
+    HostTier spill(tight_bytes);
+    CacheManager cm({{&compute, compute_blocks}, {&spill, 2 * tight_raw_blocks}}, cfg,
+                    {.spill_codec = &codec});
+    print_tier_row("spill fp8 (same bytes)", run_manager(cm, workload));
+  }
+
   // Read the columns together, not req/s alone. Evicting is free here because
   // the benchmark never pays for the recompute an eviction causes in a real
   // engine -- a prefill of this sequence length costs milliseconds of GPU time

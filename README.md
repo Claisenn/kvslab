@@ -96,6 +96,13 @@ builds by default; `-DKVSLAB_ENABLE_ASSERTS=OFF` turns those off.
   demotion to a watermark, promotion behind an `Allocation::ready()` gate, a
   small worker pool. On the oversubscription benchmark this serves 80% of the
   requests a single tier misses entirely, at 93% of its request rate.
+  Also done: an optional spill codec (`Fp8SpillCodec`, fp16 → fp8 E4M3 by
+  table lookup) that stores demoted blocks at half size, so the same spill
+  arena holds twice the entries. Quantization error is bounded by E4M3
+  round-to-nearest and paid once — a re-demotion re-encodes to the same
+  bits. On the capped-spill benchmark the codec turns a working set that
+  misses entirely (fp16 spill, 0% hit) into one that fits (80% hit, zero
+  evictions) in the same bytes.
   Remaining: an NVMe-backed tier via `io_uring`.
 - **Phase 3** — transfer engine. Zero-copy KV movement between nodes for
   prefill/decode disaggregation: TCP baseline first for correctness, then RDMA
