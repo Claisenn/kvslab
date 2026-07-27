@@ -25,6 +25,17 @@ class BlockPool;
 // represent that.
 class RadixTree {
  public:
+  // How eviction and demotion pick their victims.
+  //
+  // kLru dies on scan pollution: a burst of one-shot sequences is younger
+  // than every hot prefix, so LRU throws the hot set out to cache a stream
+  // that will never be seen again. kScanResistant splits candidates into a
+  // probation segment (touched once -- stored, never reused) and a protected
+  // one (reused at least once), evicts probation first in LRU order, and
+  // only then eats into the protected set. Two-segment SLRU, on the
+  // observation that one reuse is the cheapest honest signal of a second.
+  enum class EvictionPolicy { kLru, kScanResistant };
+
   struct Node {
     std::vector<TokenId> tokens;
     std::vector<BlockId> blocks;  // tokens.size() / block_tokens entries
@@ -34,6 +45,7 @@ class RadixTree {
     // node. Non-zero means "pinned": eviction must not touch it.
     std::uint32_t lock_count = 0;
     std::uint64_t last_access = 0;  // logical clock, for LRU
+    std::uint32_t accesses = 0;     // touches; 1 = stored and never reused
   };
 
   struct MatchResult {
@@ -82,6 +94,9 @@ class RadixTree {
   void lock(Node* node);
   void unlock(Node* node);
 
+  void set_eviction_policy(EvictionPolicy policy) { policy_ = policy; }
+  EvictionPolicy eviction_policy() const { return policy_; }
+
   std::size_t stored_blocks() const { return stored_blocks_; }
   std::size_t num_nodes() const { return num_nodes_; }
   // Inserts refused because another block already occupied the hash slot.
@@ -95,11 +110,15 @@ class RadixTree {
   Node* find_lru_leaf(const std::vector<const Node*>& rejected);
   bool tree_is_sole_owner(const Node* node) const;
   std::size_t drop_leaf(Node* victim);
-  void touch(Node* node) { node->last_access = ++clock_; }
+  void touch(Node* node) {
+    node->last_access = ++clock_;
+    ++node->accesses;
+  }
   void release_blocks(Node* node);
 
   BlockPool& pool_;
   std::size_t block_tokens_;
+  EvictionPolicy policy_ = EvictionPolicy::kLru;
   std::unique_ptr<Node> root_;
   std::uint64_t clock_ = 0;
   std::size_t stored_blocks_ = 0;

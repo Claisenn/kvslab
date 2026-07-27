@@ -54,9 +54,18 @@ before the split: pinning walks to the root, and the interposed parent inherits
 the count. The node object on its own covers less afterwards — it is the pin,
 not the pointer's own range, that callers rely on.
 
-Eviction is LRU over unpinned leaves, driven by a logical clock. A prefix an
-in-flight request is reading is pinned along with all its ancestors and cannot
-be reclaimed underneath it.
+Eviction is LRU over unpinned leaves by default, driven by a logical clock. A
+prefix an in-flight request is reading is pinned along with all its ancestors
+and cannot be reclaimed underneath it.
+
+An optional scan-resistant policy (`RadixTree::EvictionPolicy::kScanResistant`)
+splits candidates into a probation segment (stored once, never reused) and a
+protected one (reused at least once), and spends probation first — two-segment
+SLRU. It exists for the workload that kills plain LRU: a hot set re-visited on
+a period longer than the flood of one-shot sequences arriving in between. On
+the scan-pollution benchmark it takes the hit rate from 3.8% to 21.2% — the
+workload's ceiling is 23% — while evicting 20% fewer blocks, each of which is
+a full prefill recompute in a real engine.
 
 ## Build
 

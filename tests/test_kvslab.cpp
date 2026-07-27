@@ -1039,4 +1039,84 @@ TEST(cache_manager_with_codec_serves_hits_from_a_doubled_spill_tier) {
   CHECK_EQ(cm.stats().evicted_blocks, std::uint64_t{0});
 }
 
+// ---------------------------------------------------------------------------
+// Eviction policy: scan resistance.
+
+namespace {
+
+std::vector<TokenId> one_block_seq(std::size_t block_tokens, TokenId base) {
+  std::vector<TokenId> tokens(block_tokens);
+  for (std::size_t i = 0; i < tokens.size(); ++i) {
+    tokens[i] = base + static_cast<TokenId>(i);
+  }
+  return tokens;
+}
+
+}  // namespace
+
+TEST(scan_resistant_eviction_keeps_reused_prefixes_over_one_shot_scans) {
+  CacheConfig cfg;
+  cfg.num_blocks = 4;
+  cfg.block_tokens = 4;
+  cfg.num_layers = 1;
+  cfg.num_kv_heads = 1;
+  cfg.head_dim = 4;
+
+  // Same script under both policies: cache A, reuse it (that second touch is
+  // what promotes it out of probation), then stream one-shot scans until the
+  // pool has had to evict. Only the policy decides who dies.
+  for (bool scan_resistant : {false, true}) {
+    CacheManager cm(cfg);
+    if (scan_resistant) {
+      cm.tree().set_eviction_policy(RadixTree::EvictionPolicy::kScanResistant);
+    }
+
+    const auto hot = one_block_seq(cfg.block_tokens, 1000);
+    run_once(cm, hot);
+    run_once(cm, hot);  // now protected; also the LRU-oldest from here on
+
+    for (TokenId base : {2000, 3000, 4000, 5000}) {
+      run_once(cm, one_block_seq(cfg.block_tokens, base));
+    }
+    CHECK(cm.stats().evicted_blocks > 0);
+
+    auto alloc = cm.acquire(hot);
+    CHECK(alloc.ok);
+    if (scan_resistant) {
+      // The scans were all probation; the hot entry outlived every one of
+      // them despite being least recently used.
+      CHECK_EQ(alloc.cached_tokens, hot.size());
+    } else {
+      // LRU spent the hot entry on the first scan that needed a slot.
+      CHECK_EQ(alloc.cached_tokens, std::size_t{0});
+    }
+    cm.release(hot, alloc);
+  }
+}
+
+TEST(scan_resistant_falls_back_to_lru_within_a_segment) {
+  CacheConfig cfg;
+  cfg.num_blocks = 2;
+  cfg.block_tokens = 4;
+  cfg.num_layers = 1;
+  cfg.num_kv_heads = 1;
+  cfg.head_dim = 4;
+
+  CacheManager cm(cfg);
+  cm.tree().set_eviction_policy(RadixTree::EvictionPolicy::kScanResistant);
+
+  // Two one-shot entries fill the pool; both sit in probation. The third
+  // arrival must evict the older of the two, exactly as plain LRU would.
+  const auto first = one_block_seq(cfg.block_tokens, 100);
+  const auto second = one_block_seq(cfg.block_tokens, 200);
+  run_once(cm, first);
+  run_once(cm, second);
+  run_once(cm, one_block_seq(cfg.block_tokens, 300));
+
+  auto alloc = cm.acquire(second);
+  CHECK(alloc.ok);
+  CHECK_EQ(alloc.cached_tokens, second.size());  // younger probation survived
+  cm.release(second, alloc);
+}
+
 int main() { return kvcheck::run_all(); }

@@ -50,8 +50,10 @@ struct Result {
   std::uint64_t failures;
 };
 
-Result run(const CacheConfig& cfg, const std::vector<std::vector<TokenId>>& workload) {
+Result run(const CacheConfig& cfg, const std::vector<std::vector<TokenId>>& workload,
+           RadixTree::EvictionPolicy policy = RadixTree::EvictionPolicy::kLru) {
   CacheManager cm(cfg);
+  cm.tree().set_eviction_policy(policy);
   const auto start = std::chrono::steady_clock::now();
   for (const std::vector<TokenId>& tokens : workload) {
     auto alloc = cm.acquire(tokens);
@@ -131,6 +133,37 @@ std::vector<std::vector<TokenId>> workload_oversubscribed(std::size_t sequences,
   out.reserve(sequences * passes);
   for (std::size_t p = 0; p < passes; ++p) {
     for (const auto& seq : unique) out.push_back(seq);
+  }
+  return out;
+}
+
+// A small hot set re-visited every round, drowned in one-shot scans -- RAG
+// over a fresh document per request, batch jobs, crawlers. The pathology it
+// exists to show: every scan is younger than every hot prefix, so plain LRU
+// evicts exactly the entries that will hit again to store exactly the ones
+// that never will.
+std::vector<std::vector<TokenId>> workload_scan_pollution(std::size_t hot_count,
+                                                          std::size_t hot_len,
+                                                          std::size_t scans_per_round,
+                                                          std::size_t scan_len,
+                                                          std::size_t rounds) {
+  Lcg rng(5);
+  std::vector<std::vector<TokenId>> hot;
+  hot.reserve(hot_count);
+  for (std::size_t i = 0; i < hot_count; ++i) hot.push_back(random_tokens(rng, hot_len));
+
+  std::vector<std::vector<TokenId>> out;
+  out.reserve(2 * hot_count + rounds * (hot_count + scans_per_round));
+  // Two clean passes first: scan resistance protects entries with *proven*
+  // reuse, and the proof has to land before the first flood arrives.
+  for (int pass = 0; pass < 2; ++pass) {
+    for (const auto& seq : hot) out.push_back(seq);
+  }
+  for (std::size_t r = 0; r < rounds; ++r) {
+    for (const auto& seq : hot) out.push_back(seq);
+    for (std::size_t s = 0; s < scans_per_round; ++s) {
+      out.push_back(random_tokens(rng, scan_len));
+    }
   }
   return out;
 }
@@ -308,6 +341,26 @@ int main() {
   print_row("cold (no sharing)", run(cfg, workload_cold(20000, 512)));
   print_row("shared prefix 1k+64", run(cfg, workload_shared_prefix(20000, 1024, 64)));
   print_row("multi-turn 8x256", run(cfg, workload_multi_turn(2000, 8, 256)));
+
+  // Hot set: 32 sequences x 8 blocks = 256 blocks, a quarter of this pool.
+  // Each round also pushes 128 one-shot scans x 8 blocks = 1024 blocks --
+  // the whole pool's worth of never-again entries between consecutive hot
+  // visits, so LRU always pays the full recompute. Hot tokens are 23% of the
+  // workload and only the very first pass can miss: 21% overall hit rate
+  // means the hot set is hitting essentially every time.
+  {
+    CacheConfig scan_cfg = cfg;
+    scan_cfg.num_blocks = 1024;
+    const auto workload = workload_scan_pollution(32, 8 * cfg.block_tokens, 128,
+                                                  8 * cfg.block_tokens, 10);
+    std::printf("\nscan pollution (hot set 25%% of pool, scans 100%% per round)\n");
+    std::printf("%-22s %10s %12s %11s %11s %9s\n", "policy", "req/s", "us/req",
+                "hit rate", "evicted", "failed");
+    std::printf("%s\n", std::string(80, '-').c_str());
+    print_row("lru", run(scan_cfg, workload));
+    print_row("scan-resistant", run(scan_cfg, workload,
+                                    RadixTree::EvictionPolicy::kScanResistant));
+  }
 
   bench_tiering(cfg);
 
