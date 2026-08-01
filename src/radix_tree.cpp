@@ -65,6 +65,7 @@ RadixTree::Node* RadixTree::split_node(Node* node, std::size_t offset) {
   head->blocks.assign(node->blocks.begin(), node->blocks.begin() + head_blocks);
   head->parent = parent;
   head->last_access = node->last_access;
+  head->accesses = node->accesses;
   // Every pin that reaches `node` necessarily passes through its new parent.
   head->lock_count = node->lock_count;
 
@@ -242,7 +243,21 @@ RadixTree::Node* RadixTree::find_lru_leaf(const std::vector<const Node*>& reject
     if (!node->children.empty()) continue;
     if (node->lock_count > 0) continue;
     if (std::find(rejected.begin(), rejected.end(), node) != rejected.end()) continue;
-    if (best == nullptr || node->last_access < best->last_access) best = node;
+    if (best == nullptr) {
+      best = node;
+      continue;
+    }
+    if (policy_ == EvictionPolicy::kScanResistant) {
+      // Probation (stored once, never reused) goes before protected,
+      // whatever the clocks say; recency only breaks ties within a segment.
+      const bool node_probation = node->accesses < 2;
+      const bool best_probation = best->accesses < 2;
+      if (node_probation != best_probation) {
+        if (node_probation) best = node;
+        continue;
+      }
+    }
+    if (node->last_access < best->last_access) best = node;
   }
   return best;
 }

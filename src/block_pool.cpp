@@ -30,8 +30,9 @@ BlockPool::BlockPool(Tier& tier, const CacheConfig& cfg) : cfg_(cfg) {
   init({{&tier, cfg.num_blocks}});
 }
 
-BlockPool::BlockPool(const std::vector<TierSpec>& specs, const CacheConfig& cfg)
-    : cfg_(cfg) {
+BlockPool::BlockPool(const std::vector<TierSpec>& specs, const CacheConfig& cfg,
+                     const SpillCodec* spill_codec)
+    : cfg_(cfg), codec_(spill_codec) {
   init(specs);
 }
 
@@ -42,11 +43,13 @@ void BlockPool::init(const std::vector<TierSpec>& specs) {
 
   std::size_t total_blocks = 0;
   tiers_.reserve(specs.size());
-  for (const TierSpec& spec : specs) {
+  for (std::size_t idx = 0; idx < specs.size(); ++idx) {
+    const TierSpec& spec = specs[idx];
     if (spec.tier == nullptr) {
       throw std::invalid_argument("kvslab: null tier in pool spec");
     }
-    if (spec.tier->capacity_bytes() < spec.num_blocks * cfg_.block_bytes()) {
+    const std::size_t slot_bytes = tier_block_bytes(static_cast<TierIndex>(idx));
+    if (spec.tier->capacity_bytes() < spec.num_blocks * slot_bytes) {
       throw std::invalid_argument("kvslab: tier is too small for the requested pool");
     }
 
@@ -112,7 +115,17 @@ void BlockPool::worker_loop() {
     // destination slot is handed back at the next drain, not here, so the
     // scheduler never sees a slot freed by another thread.
     if (!job->cancelled.load(std::memory_order_acquire)) {
-      std::memcpy(job->dst, job->src, job->bytes);
+      switch (job->op) {
+        case MigrationJob::Op::kCopy:
+          std::memcpy(job->dst, job->src, job->bytes);
+          break;
+        case MigrationJob::Op::kEncode:
+          job->codec->encode(job->src, job->bytes, job->dst);
+          break;
+        case MigrationJob::Op::kDecode:
+          job->codec->decode(job->src, job->bytes, job->dst);
+          break;
+      }
     }
     job->done.store(true, std::memory_order_release);
     queue_cv_.notify_all();
@@ -135,14 +148,27 @@ bool BlockPool::migrate_async(BlockId id, TierIndex dst) {
   std::byte* dst_base = tiers_[dst].tier->host_data();
   if (src_base == nullptr || dst_base == nullptr) return false;
 
+  const std::size_t src_bytes = tier_block_bytes(loc.tier);
+  const std::size_t dst_bytes = tier_block_bytes(dst);
+
   auto job = std::make_unique<MigrationJob>();
   job->id = id;
   job->dst_tier = dst;
   job->dst_slot = tiers_[dst].free_slots.back();
   tiers_[dst].free_slots.pop_back();
-  job->bytes = cfg_.block_bytes();
-  job->src = src_base + static_cast<std::size_t>(loc.slot) * job->bytes;
-  job->dst = dst_base + static_cast<std::size_t>(job->dst_slot) * job->bytes;
+  job->src = src_base + static_cast<std::size_t>(loc.slot) * src_bytes;
+  job->dst = dst_base + static_cast<std::size_t>(job->dst_slot) * dst_bytes;
+  if (src_bytes == dst_bytes) {
+    job->op = MigrationJob::Op::kCopy;
+    job->bytes = src_bytes;
+  } else {
+    // Sizes differ only when a codec is set and the move crosses the
+    // compute/spill boundary; `bytes` carries the raw size either way.
+    job->op = dst_bytes < src_bytes ? MigrationJob::Op::kEncode
+                                    : MigrationJob::Op::kDecode;
+    job->bytes = cfg_.block_bytes();
+    job->codec = codec_;
+  }
 
   migrating_.emplace(id, job.get());
   {
@@ -291,24 +317,41 @@ bool BlockPool::migrate(BlockId id, TierIndex dst) {
 
   Tier& src_tier = *tiers_[loc.tier].tier;
   Tier& dst_tier = *tiers_[dst].tier;
-  const std::size_t bytes = cfg_.block_bytes();
-  const std::size_t src_off = static_cast<std::size_t>(loc.slot) * bytes;
+  const std::size_t raw = cfg_.block_bytes();
+  const std::size_t src_bytes = tier_block_bytes(loc.tier);
+  const std::size_t dst_bytes = tier_block_bytes(dst);
+  const std::size_t src_off = static_cast<std::size_t>(loc.slot) * src_bytes;
 
   const std::uint32_t dst_slot = tiers_[dst].free_slots.back();
   tiers_[dst].free_slots.pop_back();
-  const std::size_t dst_off = static_cast<std::size_t>(dst_slot) * bytes;
+  const std::size_t dst_off = static_cast<std::size_t>(dst_slot) * dst_bytes;
 
   // One copy when both sides are host-addressable, which every tier today is;
   // the bounce buffer stays as the fallback that works for any pairing. The
   // tiering benchmark moves 64 MiB per request at the default geometry, so the
-  // halved traffic is worth the branch.
+  // halved traffic is worth the branch. A codec turns the boundary-crossing
+  // copy into an encode or decode; the bounce path runs the transform in
+  // place, which the codec contract guarantees is safe.
   std::byte* src_base = src_tier.host_data();
   std::byte* dst_base = dst_tier.host_data();
   if (src_base != nullptr && dst_base != nullptr) {
-    std::memcpy(dst_base + dst_off, src_base + src_off, bytes);
+    std::byte* s = src_base + src_off;
+    std::byte* d = dst_base + dst_off;
+    if (src_bytes == dst_bytes) {
+      std::memcpy(d, s, src_bytes);
+    } else if (dst_bytes < src_bytes) {
+      codec_->encode(s, raw, d);
+    } else {
+      codec_->decode(s, raw, d);
+    }
   } else {
-    src_tier.read(src_off, bounce_.data(), bytes);
-    dst_tier.write(dst_off, bounce_.data(), bytes);
+    src_tier.read(src_off, bounce_.data(), src_bytes);
+    if (dst_bytes < src_bytes) {
+      codec_->encode(bounce_.data(), raw, bounce_.data());
+    } else if (dst_bytes > src_bytes) {
+      codec_->decode(bounce_.data(), raw, bounce_.data());
+    }
+    dst_tier.write(dst_off, bounce_.data(), dst_bytes);
   }
 
   tiers_[loc.tier].free_slots.push_back(loc.slot);
@@ -319,14 +362,14 @@ bool BlockPool::migrate(BlockId id, TierIndex dst) {
 
 std::size_t BlockPool::block_offset(BlockId id) const {
   const Location& loc = locate(id);
-  return static_cast<std::size_t>(loc.slot) * cfg_.block_bytes();
+  return static_cast<std::size_t>(loc.slot) * tier_block_bytes(loc.tier);
 }
 
 void* BlockPool::block_data(BlockId id) {
   const Location& loc = locate(id);
   std::byte* base = tiers_[loc.tier].tier->host_data();
   if (base == nullptr) return nullptr;  // device tier: use block_offset() instead
-  return base + static_cast<std::size_t>(loc.slot) * cfg_.block_bytes();
+  return base + static_cast<std::size_t>(loc.slot) * tier_block_bytes(loc.tier);
 }
 
 const void* BlockPool::block_data(BlockId id) const {
@@ -335,7 +378,7 @@ const void* BlockPool::block_data(BlockId id) const {
   // reading through it here does not mutate the pool's own state.
   std::byte* base = const_cast<Tier*>(tiers_[loc.tier].tier)->host_data();
   if (base == nullptr) return nullptr;
-  return base + static_cast<std::size_t>(loc.slot) * cfg_.block_bytes();
+  return base + static_cast<std::size_t>(loc.slot) * tier_block_bytes(loc.tier);
 }
 
 }  // namespace kvslab

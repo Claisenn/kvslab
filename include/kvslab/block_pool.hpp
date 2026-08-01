@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "kvslab/codec.hpp"
 #include "kvslab/tier.hpp"
 #include "kvslab/types.hpp"
 
@@ -50,7 +51,15 @@ class BlockPool {
 
   // Multi-tier pool. `specs[0]` is the compute tier. `cfg.num_blocks` is
   // ignored; capacity comes from the specs.
-  BlockPool(const std::vector<TierSpec>& specs, const CacheConfig& cfg);
+  //
+  // With a codec, spill tiers (every tier but 0) hold blocks in the codec's
+  // encoded form: their slots are encoded_bytes() wide, so the same arena
+  // holds proportionally more blocks -- num_blocks in the spec is still the
+  // count, the caller sizes the arena against tier_block_bytes(). Migrations
+  // crossing the compute/spill boundary encode or decode instead of copying.
+  // The codec is borrowed and must outlive the pool.
+  BlockPool(const std::vector<TierSpec>& specs, const CacheConfig& cfg,
+            const SpillCodec* spill_codec = nullptr);
 
   BlockPool(const BlockPool&) = delete;
   BlockPool& operator=(const BlockPool&) = delete;
@@ -124,6 +133,14 @@ class BlockPool {
   // tier; the offset is only meaningful together with block_tier().
   std::size_t block_offset(BlockId id) const;
 
+  // Bytes one block occupies in `tier`: cfg.block_bytes() on the compute
+  // tier, the codec's encoded size on spill tiers when a codec is set.
+  std::size_t tier_block_bytes(TierIndex tier) const {
+    return (tier == 0 || codec_ == nullptr) ? cfg_.block_bytes()
+                                            : codec_->encoded_bytes(cfg_.block_bytes());
+  }
+  const SpillCodec* spill_codec() const { return codec_; }
+
   // Direct pointer to the block's bytes, or nullptr when its current tier is
   // not host-addressable.
   void* block_data(BlockId id);
@@ -162,12 +179,16 @@ class BlockPool {
   // which the worker sets, and `cancelled`, which the worker reads to skip
   // work; src/dst pointers are immutable once queued.
   struct MigrationJob {
+    enum class Op { kCopy, kEncode, kDecode };
+
     BlockId id = kInvalidBlock;
     TierIndex dst_tier = 0;
     std::uint32_t dst_slot = 0;
     const std::byte* src = nullptr;
     std::byte* dst = nullptr;
-    std::size_t bytes = 0;
+    std::size_t bytes = 0;  // raw bytes for encode/decode, copied bytes for copy
+    Op op = Op::kCopy;
+    const SpillCodec* codec = nullptr;  // non-null iff op != kCopy
     std::atomic<bool> done{false};
     std::atomic<bool> cancelled{false};
   };
@@ -178,6 +199,7 @@ class BlockPool {
   void ensure_worker();
 
   CacheConfig cfg_;
+  const SpillCodec* codec_ = nullptr;     // borrowed; transforms spill residency
   std::unique_ptr<HostTier> owned_tier_;  // non-null only for the owning ctor
   std::vector<TierState> tiers_;
   std::vector<Location> location_;        // indexed by BlockId
